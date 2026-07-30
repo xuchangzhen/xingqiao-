@@ -79,7 +79,7 @@ function renderIncoming(sessions) {
 function showSocialChoice() {
   const source = window.prompt("选择导入来源：输入 微信、QQ 或 其他。\n在 Android 上也可先在聊天中点“分享”，选择星桥。", "微信");
   if (source === null) return; state.source = source.trim() || "社交媒体";
-  if (window.AndroidBridge?.hasPendingSocial?.()) { window.AndroidBridge.uploadPendingSocial(location.origin, state.device, state.source); toast("正在从分享内容导入…"); return; }
+  if (window.AndroidBridge?.hasPendingSocial?.() && window.AndroidBridge?.uploadPendingSocial) { window.AndroidBridge.uploadPendingSocial(location.origin, state.device, state.source); toast("正在从分享内容导入…"); return; }
   picker.click();
 }
 window.NativeSocial = { onUploaded(raw) { try { const data = JSON.parse(raw); if (!data.ok) throw Error(data.error); state.session = data.session; state.files = []; renderFiles(); $("#sendButton").innerHTML = "正在发送 <i>●</i>"; $("#privacy").textContent = "保持此页面打开；关闭后文件会立即消失"; state.heartbeat = setInterval(() => api(`/api/sessions/${state.session.id}/heartbeat`, {method:"POST"}), 6000); toast("来自社交应用的文件已发送"); refresh(); } catch (e) { toast(e.message || "导入失败"); } } };

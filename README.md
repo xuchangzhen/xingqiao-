@@ -48,6 +48,14 @@ cd android
 ./gradlew assembleRelease
 ```
 
+为了让新手打开 App 就直接进入星桥，正式发布包还应在构建时注入自己的 HTTPS 网页入口（不会写入仓库）：
+
+```bash
+./gradlew assembleRelease -PXINGQIAO_DEFAULT_WEB_URL=https://transfer.example.com
+```
+
+没有注入入口的开发包会显示“连接其他星桥”高级入口；不会在首次启动时强制要求填写地址。
+
 签名密钥、`keystore.properties`、APK 和本机 SDK 路径均不会提交到仓库。
 
 ## 验证
