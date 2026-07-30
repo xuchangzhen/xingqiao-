@@ -1,0 +1,43 @@
+plugins { id "com.android.application" }
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+def releaseValue = { name ->
+    keystoreProperties[name] ?: project.findProperty("XINGQIAO_${name.toUpperCase()}") ?: System.getenv("XINGQIAO_${name.toUpperCase()}")
+}
+def hasReleaseSigning = ["storeFile", "storePassword", "keyAlias", "keyPassword"].every { releaseValue(it) }
+
+android {
+    namespace "com.xingqiao.android"
+    compileSdk 35
+    defaultConfig {
+        applicationId "com.xingqiao.android"
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseValue("storeFile"))
+                storePassword releaseValue("storePassword")
+                keyAlias releaseValue("keyAlias")
+                keyPassword releaseValue("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+}

@@ -1,0 +1,15 @@
+.xingqiao-transfers/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/keystore.properties
+android/*.jks
+android/*.keystore
+android/*.p12
+cloud/.env
+__pycache__/
+**/__pycache__/
+.DS_Store
+*.apk
+xingqiao-cloud.tar.gz

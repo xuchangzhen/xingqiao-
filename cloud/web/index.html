@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f4f6fb"><title>星桥 · 直连快传</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/cloud-extra.css">
+</head><body>
+  <div class="aurora aurora-one"></div><div class="aurora aurora-two"></div>
+  <main>
+    <header><div class="brand-mark">✦</div><div><h1>星桥</h1><p>打开网页，即可安全直连</p></div><button class="device" id="deviceButton"><span class="pulse"></span><span id="deviceName">我的设备</span></button></header>
+    <section class="hero glass"><div class="eyebrow">P2P · ENCRYPTED · EPHEMERAL</div><h2>把文件，交给在场的人。</h2><p>文件在设备之间点对点传输，不会保存到星桥服务器。</p>
+      <div class="mode-grid"><button class="mode-card active" data-mode="photos"><span class="mode-icon">◉</span><b>相片与视频</b><small>打开相册选择</small></button><button class="mode-card" data-mode="files"><span class="mode-icon">⌁</span><b>文件</b><small>打开文件管理器</small></button><button class="mode-card" data-mode="social"><span class="mode-icon">↗</span><b>社交媒体</b><small>从微信、QQ 等导入</small></button><button class="mode-card" data-mode="clipboard"><span class="mode-icon">▣</span><b>剪贴板</b><small>粘贴文字或图片</small></button></div>
+      <input id="picker" type="file" multiple hidden><div id="dropzone" class="dropzone"><span class="drop-icon">＋</span><div><b id="dropTitle">选择相片或视频</b><p id="dropHint">也可将文件拖到这里</p></div></div><section id="clipboardPanel" class="clipboard-panel" hidden><div><b>发送剪贴板内容</b><p>可直接粘贴文字、图片或文件，也可以读取刚复制的内容。</p></div><button id="pasteClipboard" class="secondary">读取剪贴板</button><textarea id="clipboardText" placeholder="在这里粘贴或输入文字…"></textarea></section><div id="selected" class="selected" hidden></div>
+      <div class="send-row"><span id="privacy">正在连接星桥…</span><button id="sendButton" class="primary" disabled>开始发送 <i>→</i></button></div>
+    </section>
+    <section class="incoming"><div class="section-title"><div><div class="eyebrow">NEARBY NOW</div><h3>等待接收</h3></div><button id="refreshButton" class="icon-button" title="刷新">↻</button></div><div id="incomingList" class="incoming-list"><div class="empty">正在连接…</div></div></section>
+  </main>
+  <dialog id="nameDialog"><form method="dialog" class="dialog-card"><h3>给这台设备命名</h3><p>这个名称会显示给等待接收的设备。</p><input id="nameInput" maxlength="48" autocomplete="off"><div><button value="cancel" class="secondary">取消</button><button id="saveName" value="default" class="primary">保存</button></div></form></dialog><div id="toast" role="status"></div><script src="/cloud.js"></script>
+</body></html>
