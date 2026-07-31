@@ -40,6 +40,11 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.webkit.JavaScriptReplyProxy;
+import androidx.webkit.WebMessageCompat;
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -53,6 +58,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -79,6 +85,9 @@ public class MainActivity extends Activity {
     private final ArrayList<Uri> pendingSocial = new ArrayList<>();
     private final Map<String, PendingReceive> pendingReceives = new ConcurrentHashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private volatile String binaryReceiveToken;
+    private volatile boolean binaryBridgeReady;
+    private String binaryBridgeOrigin;
     private DownloadManager downloadManager;
     private long updateDownloadId = -1L;
     private BroadcastReceiver updateReceiver;
@@ -253,6 +262,7 @@ public class MainActivity extends Activity {
         trustedBridgePage = false;
         showLoading("正在建立安全连接…");
         welcomePrimary.setOnClickListener(v -> openPreferredEndpoint());
+        configureBinaryBridge(web, activeEndpoint);
         web.loadUrl(activeEndpoint);
     }
 
@@ -305,6 +315,8 @@ public class MainActivity extends Activity {
             root.removeView(web);
             web.destroy();
         }
+        binaryBridgeOrigin = null;
+        binaryBridgeReady = false;
         web = createWebView();
         root.addView(web, 0, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         showLoading("已释放媒体预览内存，正在恢复星桥…");
@@ -373,6 +385,62 @@ public class MainActivity extends Activity {
         ValueCallback<Uri[]> callback = chooserCallback;
         chooserCallback = null;
         if (callback != null) callback.onReceiveValue(value);
+    }
+
+    /**
+     * Receives small, bounded ArrayBuffer chunks directly from the WebView renderer.
+     * This avoids the Base64 expansion and synchronous JavaScript bridge that made
+     * otherwise-direct LAN transfers unnecessarily slow.
+     */
+    private void configureBinaryBridge(WebView view, String endpoint) {
+        String origin = bridgeOrigin(endpoint);
+        binaryBridgeReady = false;
+        if (origin.isEmpty()
+            || !WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
+            || !WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_ARRAY_BUFFER)) return;
+        try {
+            if (binaryBridgeOrigin != null) WebViewCompat.removeWebMessageListener(view, "XingqiaoBinaryBridge");
+            WebViewCompat.addWebMessageListener(view, "XingqiaoBinaryBridge", Collections.singleton(origin),
+                (sourceView, message, sourceOrigin, isMainFrame, replyProxy) -> receiveBinaryChunk(message, isMainFrame, replyProxy));
+            binaryBridgeOrigin = origin;
+            binaryBridgeReady = true;
+        } catch (Exception ignored) {
+            binaryBridgeOrigin = null;
+            binaryBridgeReady = false;
+        }
+    }
+
+    private void receiveBinaryChunk(WebMessageCompat message, boolean isMainFrame, JavaScriptReplyProxy replyProxy) {
+        if (!isMainFrame || message.getType() != WebMessageCompat.TYPE_ARRAY_BUFFER) return;
+        final String token = binaryReceiveToken;
+        final PendingReceive receive = token == null ? null : pendingReceives.get(token);
+        if (receive == null) { replyBinaryResult(replyProxy, false); return; }
+        final byte[] bytes = message.getArrayBuffer();
+        // WebMessageListener runs on the UI thread. Persist elsewhere, and only
+        // acknowledge after the bytes are safely written to MediaStore.
+        io.execute(() -> {
+            boolean ok = false;
+            try {
+                synchronized (receive) { receive.output.write(bytes); }
+                ok = true;
+            } catch (Exception error) { new ShareBridge().abortReceiveFile(token); }
+            replyBinaryResult(replyProxy, ok);
+        });
+    }
+
+    private void replyBinaryResult(JavaScriptReplyProxy replyProxy, boolean ok) {
+        runOnUiThread(() -> {
+            try { replyProxy.postMessage(ok ? "{\"ok\":true}" : "{\"ok\":false}"); } catch (Exception ignored) { }
+        });
+    }
+
+    private static String bridgeOrigin(String endpoint) {
+        try {
+            Uri uri = Uri.parse(endpoint == null ? "" : endpoint);
+            String scheme = uri.getScheme(); String host = uri.getHost();
+            if (scheme == null || host == null || (!"https".equalsIgnoreCase(scheme) && !"http".equalsIgnoreCase(scheme))) return "";
+            return scheme.toLowerCase() + "://" + host + (uri.getPort() < 0 ? "" : ":" + uri.getPort());
+        } catch (Exception ignored) { return ""; }
     }
 
     /** The updater is opt-in at build time, so public source never needs a personal release URL. */
@@ -561,7 +629,9 @@ public class MainActivity extends Activity {
                 if (output == null) { getContentResolver().delete(uri, null, null); throw new IOException("无法写入保存位置"); }
                 String token = UUID.randomUUID().toString();
                 pendingReceives.put(token, new PendingReceive(uri, output, destination.displayFolder));
-                return new JSONObject().put("ok", true).put("token", token).put("folder", destination.displayFolder).toString();
+                boolean binary = binaryBridgeReady;
+                if (binary) binaryReceiveToken = token;
+                return new JSONObject().put("ok", true).put("token", token).put("folder", destination.displayFolder).put("binary", binary).toString();
             } catch (Exception error) { return "{\"ok\":false}"; }
         }
 
@@ -578,13 +648,17 @@ public class MainActivity extends Activity {
             PendingReceive receive = pendingReceives.remove(token);
             if (receive == null) return "{\"ok\":false}";
             try {
-                receive.output.flush();
-                receive.output.close();
+                synchronized (receive) {
+                    receive.output.flush();
+                    receive.output.close();
+                }
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.MediaColumns.IS_PENDING, 0);
                 getContentResolver().update(receive.uri, values, null, null);
+                if (token.equals(binaryReceiveToken)) binaryReceiveToken = null;
                 return new JSONObject().put("ok", true).put("folder", receive.folder).toString();
             } catch (Exception error) {
+                if (token.equals(binaryReceiveToken)) binaryReceiveToken = null;
                 try { getContentResolver().delete(receive.uri, null, null); } catch (Exception ignored) { }
                 return "{\"ok\":false}";
             }
@@ -593,7 +667,8 @@ public class MainActivity extends Activity {
         @android.webkit.JavascriptInterface public void abortReceiveFile(String token) {
             PendingReceive receive = pendingReceives.remove(token);
             if (receive == null) return;
-            try { receive.output.close(); } catch (Exception ignored) { }
+            if (token.equals(binaryReceiveToken)) binaryReceiveToken = null;
+            try { synchronized (receive) { receive.output.close(); } } catch (Exception ignored) { }
             try { getContentResolver().delete(receive.uri, null, null); } catch (Exception ignored) { }
         }
         /** Local-network server compatibility: the desktop coordinator accepts this multipart upload. */

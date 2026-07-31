@@ -31,6 +31,10 @@ const peers = new Map();
 const channels = new Set();
 const pendingCandidates = new Map();
 const receiveFolders = new Map();
+// Android's modern WebView bridge replies after each ArrayBuffer has reached
+// MediaStore. Keeping this queue explicit prevents unbounded renderer-to-app
+// copies while the disk writer is busy.
+const binaryWriteWaiters = [];
 let hostPublishRetry;
 const RENDERED_FILE_LIMIT = 60;
 const META_PREVIEW_LIMIT = 12;
@@ -472,6 +476,7 @@ function setupChannel(channel, remote, room, selectedIndexes = null) {
   channel.ackWaiters = [];
   channels.add(channel);
   channel.onopen = () => {
+    showConnectionPath(remote);
     if (!channel.isSender || state.hosted !== room) return;
     channel.outgoingFiles = state.activeFiles.filter((_, index) => channel.selectedIndexes.includes(index));
     beginOutgoingProgress(room, channel.outgoingFiles);
@@ -492,8 +497,39 @@ function setupChannel(channel, remote, room, selectedIndexes = null) {
   channel.onclose = () => {
     channels.delete(channel);
     wakeAckWaiters(channel);
+    if (channel.currentFile?.android?.token) {
+      try { window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token); } catch (_) {}
+      abortAndroidBinaryWrites("连接已关闭");
+    }
     toast("设备连接已关闭");
   };
+}
+
+async function showConnectionPath(remote, attempt = 0) {
+  const peer = peers.get(remote);
+  if (!peer) return;
+  try {
+    const reports = new Map();
+    (await peer.getStats()).forEach(report => reports.set(report.id, report));
+    const pair = [...reports.values()].find(report => report.type === "candidate-pair"
+      && report.state === "succeeded" && (report.selected || report.nominated));
+    if (!pair) {
+      if (attempt < 6) setTimeout(() => showConnectionPath(remote, attempt + 1), 500);
+      return;
+    }
+    const local = reports.get(pair.localCandidateId);
+    const remoteCandidate = reports.get(pair.remoteCandidateId);
+    const types = [local?.candidateType, remoteCandidate?.candidateType];
+    if (types.includes("relay")) {
+      $("#privacy").textContent = "已连接：正在通过公网中转传输（速度受网络影响）";
+    } else if (types.includes("host")) {
+      $("#privacy").textContent = "已连接：局域网直连传输";
+    } else {
+      $("#privacy").textContent = "已连接：设备点对点直传";
+    }
+  } catch (_) {
+    // Transfer itself does not depend on diagnostic statistics being available.
+  }
 }
 
 async function createOffer(remote, room, selectedIndexes) {
@@ -560,6 +596,7 @@ function flushReceiveAck(channel) {
 function stopIncomingChannel(channel, message) {
   channel.aborted = true;
   channel.abortReason = message;
+  abortAndroidBinaryWrites(message);
   if (channel.currentFile?.android?.token) {
     try { window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token); } catch (_) {}
   }
@@ -659,6 +696,48 @@ function downloadFallback(blob, name) {
 
 function androidAutoSaveAvailable() { return Boolean(window.AndroidBridge?.beginReceiveFile && window.AndroidBridge?.writeReceiveChunk && window.AndroidBridge?.finishReceiveFile); }
 function readBridgeJson(raw) { try { return JSON.parse(raw); } catch (_) { return null; } }
+function supportsAndroidBinarySave() { return Boolean(window.XingqiaoBinaryBridge?.postMessage); }
+function removeBinaryWriteWaiter(waiter) {
+  const index = binaryWriteWaiters.indexOf(waiter);
+  if (index >= 0) binaryWriteWaiters.splice(index, 1);
+}
+function abortAndroidBinaryWrites(message = "安卓保存通道已关闭") {
+  const waiters = binaryWriteWaiters.splice(0);
+  waiters.forEach(waiter => {
+    clearTimeout(waiter.timer);
+    waiter.reject(new Error(message));
+  });
+}
+function setupAndroidBinaryBridge() {
+  const bridge = window.XingqiaoBinaryBridge;
+  if (!bridge?.postMessage) return;
+  bridge.onmessage = event => {
+    const waiter = binaryWriteWaiters.shift();
+    if (!waiter) return;
+    clearTimeout(waiter.timer);
+    const result = readBridgeJson(event.data);
+    if (result?.ok) waiter.resolve();
+    else waiter.reject(new Error("安卓未能写入文件"));
+  };
+}
+function writeAndroidBinaryChunk(buffer) {
+  return new Promise((resolve, reject) => {
+    const bridge = window.XingqiaoBinaryBridge;
+    if (!bridge?.postMessage) { reject(new Error("安卓二进制保存通道不可用")); return; }
+    const waiter = { resolve, reject, timer: null };
+    waiter.timer = setTimeout(() => {
+      removeBinaryWriteWaiter(waiter);
+      reject(new Error("安卓保存响应超时"));
+    }, 15_000);
+    binaryWriteWaiters.push(waiter);
+    try { bridge.postMessage(buffer); }
+    catch (error) {
+      clearTimeout(waiter.timer);
+      removeBinaryWriteWaiter(waiter);
+      reject(error);
+    }
+  });
+}
 function bufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer); let value = "";
   for (let offset = 0; offset < bytes.length; offset += 8192) value += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
@@ -667,6 +746,7 @@ function bufferToBase64(buffer) {
 function startAndroidSave(name, mime) {
   if (!androidAutoSaveAvailable()) return null;
   const result = readBridgeJson(window.AndroidBridge.beginReceiveFile(name, mime));
+  if (result?.binary && !supportsAndroidBinarySave()) result.binary = false;
   return result?.ok ? result : null;
 }
 function finishAndroidSave(token) {
@@ -746,7 +826,10 @@ async function receive(channel, data) {
   const bytes = data.byteLength || 0;
   if (channel.currentFile?.writer) await channel.currentFile.writer.write(data);
   else if (channel.currentFile?.android && !channel.currentFile.androidFailed) {
-    if (!window.AndroidBridge.writeReceiveChunk(channel.currentFile.android.token, bufferToBase64(data))) {
+    try {
+      if (channel.currentFile.android.binary) await writeAndroidBinaryChunk(data);
+      else if (!window.AndroidBridge.writeReceiveChunk(channel.currentFile.android.token, bufferToBase64(data))) throw new Error("安卓保存通道中断");
+    } catch (_) {
       channel.currentFile.androidFailed = true;
       stopIncomingChannel(channel, "安卓保存通道中断，已停止传输");
       return;
@@ -906,5 +989,6 @@ window.addEventListener("pagehide", () => {
   if (room) send({ type: "leave", room });
   peers.forEach(peer => peer.close());
 });
+setupAndroidBinaryBridge();
 setMode("photos"); renderFiles(); importAndroidSharedFiles(); connect();
 setupAndroidUpdate();
