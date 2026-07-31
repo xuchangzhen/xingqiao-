@@ -43,10 +43,17 @@ const MAX_BATCH_FILES = 40;
 const PROGRESS_PAINT_INTERVAL = 160;
 // Keep Android's queued WebView/MediaStore work bounded, but leave enough data
 // in flight to fill a normal Wi-Fi link even when WebRTC has a higher RTT.
-const TRANSFER_CHUNK_BYTES = 32 * 1024;
+// Read Android content URIs in larger blocks. Android WebView pays a noticeable
+// scheduling cost for every File.slice().arrayBuffer() call, so small network
+// frames are carved out of a larger read instead of reopening the picker URI
+// thousands of times for a long video.
+const FILE_READ_BLOCK_BYTES = 1024 * 1024;
+const DEFAULT_DATA_CHANNEL_CHUNK_BYTES = 60 * 1024;
+const MAX_DATA_CHANNEL_CHUNK_BYTES = 128 * 1024;
 const RECEIVE_ACK_BYTES = 256 * 1024;
 const MAX_IN_FLIGHT_BYTES = 1024 * 1024;
-const MAX_DATA_CHANNEL_BUFFERED_BYTES = 512 * 1024;
+const MAX_DATA_CHANNEL_BUFFERED_BYTES = 768 * 1024;
+const DATA_CHANNEL_BUFFER_LOW_BYTES = 384 * 1024;
 const BROWSER_FALLBACK_MAX_BYTES = 128 * 1024 * 1024;
 
 function escapeHtml(value) { const node = document.createElement("div"); node.textContent = value; return node.innerHTML; }
@@ -470,10 +477,12 @@ function setupChannel(channel, remote, room, selectedIndexes = null) {
   channel.selectedIndexes = selectedIndexes || [];
   channel.outgoingFiles = [];
   channel.room = room;
+  channel.remote = remote;
   channel.folder = receiveFolders.get(room) || null;
   channel.inFlightBytes = 0;
   channel.receivedSinceAck = 0;
   channel.ackWaiters = [];
+  channel.bufferedAmountLowThreshold = DATA_CHANNEL_BUFFER_LOW_BYTES;
   channels.add(channel);
   channel.onopen = () => {
     showConnectionPath(remote);
@@ -519,13 +528,15 @@ async function showConnectionPath(remote, attempt = 0) {
     }
     const local = reports.get(pair.localCandidateId);
     const remoteCandidate = reports.get(pair.remoteCandidateId);
-    const types = [local?.candidateType, remoteCandidate?.candidateType];
-    if (types.includes("relay")) {
-      $("#privacy").textContent = "已连接：正在通过公网中转传输（速度受网络影响）";
-    } else if (types.includes("host")) {
-      $("#privacy").textContent = "已连接：局域网直连传输";
+    const localType = local?.candidateType || "未知";
+    const remoteType = remoteCandidate?.candidateType || "未知";
+    const pairName = `${localType} ↔ ${remoteType}`;
+    if (localType === "relay" || remoteType === "relay") {
+      $("#privacy").textContent = `已连接：公网中转传输（${pairName}，速度受网络影响）`;
+    } else if (localType === "host" && remoteType === "host") {
+      $("#privacy").textContent = `已连接：局域网直连传输（${pairName}）`;
     } else {
-      $("#privacy").textContent = "已连接：设备点对点直传";
+      $("#privacy").textContent = `已连接：设备点对点直传（${pairName}）`;
     }
   } catch (_) {
     // Transfer itself does not depend on diagnostic statistics being available.
@@ -582,6 +593,36 @@ async function waitForAllRemoteCredit(channel) {
   }
 }
 
+function dataChannelChunkBytes(channel) {
+  const advertised = Number(peers.get(channel.remote)?.sctp?.maxMessageSize);
+  if (Number.isFinite(advertised) && advertised > 0) {
+    // Leave a small margin for implementations that account SCTP framing in
+    // the reported size. The negotiated value is the authoritative limit.
+    const safeSize = Math.floor(advertised - 1024);
+    if (safeSize > 0) return Math.min(MAX_DATA_CHANNEL_CHUNK_BYTES, safeSize);
+  }
+  return DEFAULT_DATA_CHANNEL_CHUNK_BYTES;
+}
+
+function waitForDataChannelDrain(channel) {
+  if (channel.bufferedAmount <= MAX_DATA_CHANNEL_BUFFERED_BYTES) return Promise.resolve();
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      channel.removeEventListener("bufferedamountlow", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, 250);
+    channel.addEventListener("bufferedamountlow", finish);
+    // Avoid the small race where the buffer drains between the first check and
+    // listener registration.
+    if (channel.bufferedAmount <= DATA_CHANNEL_BUFFER_LOW_BYTES) finish();
+  });
+}
+
 function acknowledgeReceivedChunk(channel, bytes) {
   channel.receivedSinceAck += bytes;
   if (channel.receivedSinceAck >= RECEIVE_ACK_BYTES) flushReceiveAck(channel);
@@ -614,13 +655,17 @@ async function sendFiles(channel) {
       renderSendProgress();
     }
     channel.send(JSON.stringify({ type: "file-start", name: file.name, size: file.size, mime: file.type || "application/octet-stream" }));
-    for (let offset = 0; offset < file.size; offset += TRANSFER_CHUNK_BYTES) {
-      await waitForRemoteCredit(channel);
-      while (channel.bufferedAmount > MAX_DATA_CHANNEL_BUFFERED_BYTES) await new Promise(resolve => setTimeout(resolve, 10));
-      const chunk = await file.slice(offset, offset + TRANSFER_CHUNK_BYTES).arrayBuffer();
-      channel.send(chunk);
-      channel.inFlightBytes += chunk.byteLength;
-      advanceOutgoingProgress(channel.room, chunk.byteLength);
+    const chunkSize = dataChannelChunkBytes(channel);
+    for (let readOffset = 0; readOffset < file.size; readOffset += FILE_READ_BLOCK_BYTES) {
+      const block = await file.slice(readOffset, readOffset + FILE_READ_BLOCK_BYTES).arrayBuffer();
+      for (let offset = 0; offset < block.byteLength; offset += chunkSize) {
+        await waitForRemoteCredit(channel);
+        while (channel.bufferedAmount > MAX_DATA_CHANNEL_BUFFERED_BYTES) await waitForDataChannelDrain(channel);
+        const chunk = block.slice(offset, Math.min(offset + chunkSize, block.byteLength));
+        channel.send(chunk);
+        channel.inFlightBytes += chunk.byteLength;
+        advanceOutgoingProgress(channel.room, chunk.byteLength);
+      }
     }
     channel.send(JSON.stringify({ type: "file-end" }));
     if (progress?.room === channel.room) {
