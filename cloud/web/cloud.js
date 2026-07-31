@@ -238,8 +238,18 @@ async function acceptFiles(button) {
   if (androidAutoSaveAvailable()) {
     toast("安卓会按文件类型自动保存到星桥目录");
   } else if (window.showDirectoryPicker) {
-    try { folder = await window.showDirectoryPicker({ mode: "readwrite" }); }
-    catch (_) { toast("未选择保存位置，尚未开始接收"); return; }
+    try {
+      // Start at Desktop instead of the browser's last-used location. Browsers
+      // intentionally deny sensitive system folders, while Desktop is a normal
+      // user-writable location once the user confirms the permission prompt.
+      folder = await window.showDirectoryPicker({ id: "xingqiao-receive", mode: "readwrite", startIn: "desktop" });
+      const permission = await folder.queryPermission({ mode: "readwrite" });
+      if (permission !== "granted" && await folder.requestPermission({ mode: "readwrite" }) !== "granted") throw new DOMException("保存权限未授权", "NotAllowedError");
+    } catch (error) {
+      const denied = error?.name === "AbortError" || error?.name === "NotAllowedError";
+      toast(denied ? "系统目录不能保存；请在打开的窗口中选择“桌面”或普通文件夹并允许写入" : "未选择保存位置，尚未开始接收");
+      return;
+    }
   } else toast("此浏览器不支持选择目录，将保存到浏览器默认下载位置");
   receiveFolders.set(button.dataset.room, folder);
   send({ type: "join", room: button.dataset.room, selected: selectedIndexes });
