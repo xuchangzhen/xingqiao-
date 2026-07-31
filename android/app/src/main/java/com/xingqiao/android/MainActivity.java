@@ -307,6 +307,7 @@ public class MainActivity extends Activity {
 
     /** A WebView renderer can be reclaimed after a memory-heavy local media preview. It cannot be reused. */
     private void recoverWebViewAfterRendererGone() {
+        TransferService.stop(this);
         finishFileChooser(null);
         trustedBridgePage = false;
         pageLoaded = false;
@@ -370,6 +371,7 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        TransferService.stop(this);
         finishFileChooser(null);
         for (String token : new ArrayList<>(pendingReceives.keySet())) new ShareBridge().abortReceiveFile(token);
         if (updateReceiver != null) {
@@ -567,6 +569,14 @@ public class MainActivity extends Activity {
 
     final class ShareBridge {
         @android.webkit.JavascriptInterface public void checkForUpdate() { if (isTrustedBridgeCall()) MainActivity.this.checkForUpdate(); }
+        /** A user-initiated transfer may continue after the Activity is backgrounded. */
+        @android.webkit.JavascriptInterface public void setTransferActive(boolean active) {
+            if (!isTrustedBridgeCall()) return;
+            runOnUiThread(() -> {
+                if (active) TransferService.start(MainActivity.this);
+                else TransferService.stop(MainActivity.this);
+            });
+        }
         @android.webkit.JavascriptInterface public boolean hasPendingSocial() { return !pendingSocial.isEmpty(); }
         @android.webkit.JavascriptInterface public String pendingSocialManifest() {
             if (!isTrustedBridgeCall()) return "{\"files\":[]}";

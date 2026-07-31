@@ -51,6 +51,20 @@ class SignalHubTest(unittest.TestCase):
         self.assertEqual(listed["rooms"][0]["room"], "abc123def456")
         self.assertEqual(listed["rooms"][0]["files"][0]["name"], "example.txt")
 
+    def test_join_forwards_receiver_capacity_without_trusting_other_values(self) -> None:
+        async def scenario(receiver: str) -> dict:
+            hub = SignalHub()
+            owner, joining = FakeSocket(), FakeSocket()
+            hub.peers = {"owner": owner, "joining": joining}
+            await hub.receive("owner", {"type": "host", "room": "abc123def456", "meta": {"files": [{"name": "video.mp4"}]}})
+            await hub.receive("joining", {"type": "join", "room": "abc123def456", "selected": [0], "receiver": receiver})
+            return owner.json_messages[-1]
+
+        android = asyncio.run(scenario("android"))
+        browser = asyncio.run(scenario("anything-else"))
+        self.assertEqual(android["receiver"], "android")
+        self.assertEqual(browser["receiver"], "browser")
+
 
 if __name__ == "__main__":
     unittest.main()

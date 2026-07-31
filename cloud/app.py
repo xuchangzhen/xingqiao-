@@ -84,8 +84,9 @@ class SignalHub:
             selected = sorted({index for index in selected if isinstance(index, int) and 0 <= index < len(data["meta"]["files"])})
             if not selected:
                 return
+            receiver = "android" if payload.get("receiver") == "android" else "browser"
             await self.peers[peer_id].send_json({"type": "joined", "room": room, "owner": data["owner"]})
-            await self.peers[data["owner"]].send_json({"type": "peer-joined", "room": room, "peer": peer_id, "selected": selected})
+            await self.peers[data["owner"]].send_json({"type": "peer-joined", "room": room, "peer": peer_id, "selected": selected, "receiver": receiver})
             return
         if kind == "signal":
             target = str(payload.get("target", ""))

@@ -35,6 +35,7 @@ const receiveFolders = new Map();
 // MediaStore. Keeping this queue explicit prevents unbounded renderer-to-app
 // copies while the disk writer is busy.
 const binaryWriteWaiters = [];
+const nativeTransferKeys = new Set();
 let hostPublishRetry;
 const RENDERED_FILE_LIMIT = 60;
 const META_PREVIEW_LIMIT = 12;
@@ -52,9 +53,10 @@ const FILE_READ_BLOCK_BYTES = 1024 * 1024;
 const DEFAULT_DATA_CHANNEL_CHUNK_BYTES = 60 * 1024;
 const MAX_DATA_CHANNEL_CHUNK_BYTES = 128 * 1024;
 const RECEIVE_ACK_BYTES = 256 * 1024;
-const MAX_IN_FLIGHT_BYTES = 1024 * 1024;
-const MAX_DATA_CHANNEL_BUFFERED_BYTES = 768 * 1024;
-const DATA_CHANNEL_BUFFER_LOW_BYTES = 384 * 1024;
+const ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES = 1024 * 1024;
+const BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
+const ANDROID_RECEIVER_BUFFER_HIGH_BYTES = 768 * 1024;
+const BROWSER_RECEIVER_BUFFER_HIGH_BYTES = 2 * 1024 * 1024;
 const BROWSER_FALLBACK_MAX_BYTES = 128 * 1024 * 1024;
 
 function escapeHtml(value) { const node = document.createElement("div"); node.textContent = value; return node.innerHTML; }
@@ -419,7 +421,10 @@ async function acceptFiles(button) {
   receiveFolders.set(button.dataset.room, folder);
   state.incomingProgress.set(button.dataset.room, newTransferProgress(button.dataset.room, files, "receive", source?.sender || "对方设备"));
   renderIncoming();
-  send({ type: "join", room: button.dataset.room, selected: selectedIndexes });
+  // Start while this user action is visible. Android 12+ can reject a newly
+  // created foreground service after the Activity has already gone background.
+  setAndroidTransferActive(`receive:${button.dataset.room}`, true);
+  send({ type: "join", room: button.dataset.room, selected: selectedIndexes, receiver: androidAutoSaveAvailable() ? "android" : "browser" });
   toast("正在建立设备直连…");
 }
 
@@ -430,6 +435,7 @@ async function host() {
   const room = newRoomCode();
   const pending = { room, meta: null };
   state.pendingHost = pending;
+  setAndroidTransferActive(`send-pending:${room}`, true);
   $("#sendButton").innerHTML = "准备传输信息…";
   renderFiles();
   try {
@@ -443,6 +449,7 @@ async function host() {
     state.activeFiles = [];
     state.hostMeta = null;
     state.pendingHost = null;
+    setAndroidTransferActive(`send-pending:${room}`, false);
     renderFiles();
     toast("无法准备文件预览，请重新选择后发送");
   }
@@ -474,7 +481,7 @@ function buildPeer(remote, room, selectedIndexes = null) {
   return connection;
 }
 
-function setupChannel(channel, remote, room, selectedIndexes = null) {
+function setupChannel(channel, remote, room, selectedIndexes = null, receiverKind = "browser") {
   channel.binaryType = "arraybuffer";
   channel.currentFile = null;
   channel.isSender = Array.isArray(selectedIndexes);
@@ -486,7 +493,10 @@ function setupChannel(channel, remote, room, selectedIndexes = null) {
   channel.inFlightBytes = 0;
   channel.receivedSinceAck = 0;
   channel.ackWaiters = [];
-  channel.bufferedAmountLowThreshold = DATA_CHANNEL_BUFFER_LOW_BYTES;
+  channel.maxInFlightBytes = receiverKind === "android" ? ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES : BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES;
+  channel.bufferHighWaterBytes = receiverKind === "android" ? ANDROID_RECEIVER_BUFFER_HIGH_BYTES : BROWSER_RECEIVER_BUFFER_HIGH_BYTES;
+  channel.bufferLowWaterBytes = Math.floor(channel.bufferHighWaterBytes / 2);
+  channel.bufferedAmountLowThreshold = channel.bufferLowWaterBytes;
   channels.add(channel);
   channel.onopen = () => {
     showConnectionPath(remote);
@@ -510,6 +520,7 @@ function setupChannel(channel, remote, room, selectedIndexes = null) {
   channel.onclose = () => {
     channels.delete(channel);
     wakeAckWaiters(channel);
+    setAndroidTransferActive(`receive:${channel.room}`, false);
     if (channel.currentFile?.android?.token) {
       try { window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token); } catch (_) {}
       abortAndroidBinaryWrites("连接已关闭");
@@ -547,10 +558,10 @@ async function showConnectionPath(remote, attempt = 0) {
   }
 }
 
-async function createOffer(remote, room, selectedIndexes) {
+async function createOffer(remote, room, selectedIndexes, receiverKind = "browser") {
   const connection = buildPeer(remote, room, selectedIndexes);
   const channel = connection.createDataChannel("xingqiao-files", { ordered: true });
-  setupChannel(channel, remote, room, selectedIndexes);
+  setupChannel(channel, remote, room, selectedIndexes, receiverKind);
   await connection.setLocalDescription(await connection.createOffer());
   send({ type: "signal", target: remote, room, payload: { kind: "offer", sdp: connection.localDescription } });
 }
@@ -584,7 +595,7 @@ function releaseRemoteCredit(channel, bytes) {
 
 async function waitForRemoteCredit(channel) {
   if (channel.aborted) throw new Error(channel.abortReason || "接收端已停止传输");
-  while (channel.inFlightBytes >= MAX_IN_FLIGHT_BYTES) {
+  while (channel.inFlightBytes >= channel.maxInFlightBytes) {
     await new Promise(resolve => channel.ackWaiters.push(resolve));
     if (channel.readyState !== "open" || channel.aborted) throw new Error(channel.abortReason || "连接已关闭");
   }
@@ -609,7 +620,7 @@ function dataChannelChunkBytes(channel) {
 }
 
 function waitForDataChannelDrain(channel) {
-  if (channel.bufferedAmount <= MAX_DATA_CHANNEL_BUFFERED_BYTES) return Promise.resolve();
+  if (channel.bufferedAmount <= channel.bufferHighWaterBytes) return Promise.resolve();
   return new Promise(resolve => {
     let settled = false;
     const finish = () => {
@@ -623,7 +634,7 @@ function waitForDataChannelDrain(channel) {
     channel.addEventListener("bufferedamountlow", finish);
     // Avoid the small race where the buffer drains between the first check and
     // listener registration.
-    if (channel.bufferedAmount <= DATA_CHANNEL_BUFFER_LOW_BYTES) finish();
+    if (channel.bufferedAmount <= channel.bufferLowWaterBytes) finish();
   });
 }
 
@@ -641,6 +652,7 @@ function flushReceiveAck(channel) {
 function stopIncomingChannel(channel, message) {
   channel.aborted = true;
   channel.abortReason = message;
+  setAndroidTransferActive(`receive:${channel.room}`, false);
   abortAndroidBinaryWrites(message);
   if (channel.currentFile?.android?.token) {
     try { window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token); } catch (_) {}
@@ -651,6 +663,16 @@ function stopIncomingChannel(channel, message) {
 }
 
 async function sendFiles(channel) {
+  const transferKey = `send:${channel.room}`;
+  setAndroidTransferActive(transferKey, true);
+  try {
+    await sendFilesImpl(channel);
+  } finally {
+    setAndroidTransferActive(transferKey, false);
+  }
+}
+
+async function sendFilesImpl(channel) {
   const files = channel.outgoingFiles;
   for (const file of files) {
     const progress = state.outgoingProgress;
@@ -675,7 +697,7 @@ async function sendFiles(channel) {
       pendingBlock = readNextBlock();
       for (let offset = 0; offset < block.byteLength; offset += chunkSize) {
         await waitForRemoteCredit(channel);
-        while (channel.bufferedAmount > MAX_DATA_CHANNEL_BUFFERED_BYTES) await waitForDataChannelDrain(channel);
+        while (channel.bufferedAmount > channel.bufferHighWaterBytes) await waitForDataChannelDrain(channel);
         const chunk = block.slice(offset, Math.min(offset + chunkSize, block.byteLength));
         channel.send(chunk);
         channel.inFlightBytes += chunk.byteLength;
@@ -709,6 +731,7 @@ function finishOutgoingBatch(room) {
   state.clipboardImages = [];
   state.clipboardText = "";
   $("#clipboardText").value = "";
+  setAndroidTransferActive(`send-pending:${room}`, false);
   $("#privacy").textContent = "本批已发送完成；请选择下一批文件后再次点击“开始发送”";
   $("#sendButton").innerHTML = "开始发送 <i>→</i>";
   renderFiles();
@@ -733,6 +756,7 @@ function cancelOutgoingBatch() {
   state.pendingHost = null;
   state.hostMeta = null;
   state.activeFiles = [];
+  setAndroidTransferActive(`send-pending:${room}`, false);
   stopOutgoingProgress(room);
   $("#privacy").textContent = "已取消本批；可调整文件后重新点击“开始发送”";
   $("#sendButton").innerHTML = "开始发送 <i>→</i>";
@@ -756,6 +780,12 @@ function downloadFallback(blob, name) {
 
 function androidAutoSaveAvailable() { return Boolean(window.AndroidBridge?.beginReceiveFile && window.AndroidBridge?.writeReceiveChunk && window.AndroidBridge?.finishReceiveFile); }
 function readBridgeJson(raw) { try { return JSON.parse(raw); } catch (_) { return null; } }
+function setAndroidTransferActive(key, active) {
+  if (!window.AndroidBridge?.setTransferActive) return;
+  if (active) nativeTransferKeys.add(key);
+  else nativeTransferKeys.delete(key);
+  try { window.AndroidBridge.setTransferActive(nativeTransferKeys.size > 0); } catch (_) {}
+}
 function supportsAndroidBinarySave() { return Boolean(window.XingqiaoBinaryBridge?.postMessage); }
 function removeBinaryWriteWaiter(waiter) {
   const index = binaryWriteWaiters.indexOf(waiter);
@@ -820,10 +850,12 @@ async function receive(channel, data) {
       channel.aborted = true;
       channel.abortReason = message.reason || "接收端已停止传输";
       wakeAckWaiters(channel);
+      setAndroidTransferActive(`receive:${channel.room}`, false);
       return;
     }
     if (message.type === "file-start") {
       channel.currentFile = { name: message.name, size: message.size, mime: message.mime, chunks: [] };
+      setAndroidTransferActive(`receive:${channel.room}`, true);
       const progress = state.incomingProgress.get(channel.room);
       if (progress) {
         progress.currentName = message.name;
@@ -880,6 +912,7 @@ async function receive(channel, data) {
     if (message.type === "complete") {
       flushReceiveAck(channel);
       finishIncomingProgress(channel.room);
+      setAndroidTransferActive(`receive:${channel.room}`, false);
     }
     return;
   }
@@ -927,7 +960,7 @@ async function connect() {
     }
     if (message.type === "peer-joined" && state.hosted === message.room) {
       $("#sendButton").innerHTML = "正在传输… <i>●</i>";
-      createOffer(message.peer, message.room, message.selected).catch(() => toast("无法建立设备直连，请确认双方仍在线后重试"));
+      createOffer(message.peer, message.room, message.selected, message.receiver).catch(() => toast("无法建立设备直连，请确认双方仍在线后重试"));
     }
     if (message.type === "signal") await handleSignal(message.from, message.room, message.payload);
   };
@@ -1047,6 +1080,8 @@ window.addEventListener("pagehide", () => {
   clearTimeout(hostPublishRetry);
   const room = state.hosted || state.pendingHost?.room;
   if (room) send({ type: "leave", room });
+  nativeTransferKeys.clear();
+  try { window.AndroidBridge?.setTransferActive?.(false); } catch (_) {}
   peers.forEach(peer => peer.close());
 });
 setupAndroidBinaryBridge();
