@@ -134,8 +134,16 @@ async def index(_: web.Request) -> web.FileResponse:
     return web.FileResponse(WEB / "index.html")
 
 
+@web.middleware
+async def no_cache_client_shell(request: web.Request, handler: web.Handler) -> web.StreamResponse:
+    response = await handler(request)
+    if request.path == "/" or request.path.endswith((".html", ".js", ".css")):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
 def app() -> web.Application:
-    instance = web.Application()
+    instance = web.Application(middlewares=[no_cache_client_shell])
     instance.router.add_get("/signal", signal)
     instance.router.add_get("/api/config", config)
     instance.router.add_get("/", index)

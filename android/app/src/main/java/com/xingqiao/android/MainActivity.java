@@ -105,6 +105,10 @@ public class MainActivity extends Activity {
         settings.setAllowContentAccess(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setSupportZoom(false);
+        // The transfer page changes together with the native bridge. Never let an old
+        // cached cloud.js keep an installed App on an incompatible protocol.
+        settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
+        view.clearCache(true);
         view.addJavascriptInterface(new ShareBridge(), "AndroidBridge");
         view.setWebViewClient(new WebViewClient() {
             @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
