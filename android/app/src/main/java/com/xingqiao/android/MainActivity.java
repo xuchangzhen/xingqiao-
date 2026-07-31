@@ -22,6 +22,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceError;
 import android.webkit.WebSettings;
@@ -64,6 +65,7 @@ public class MainActivity extends Activity {
     private static final String PREF_ENDPOINT = "endpoint";
 
     private WebView web;
+    private FrameLayout root;
     private View welcomeLayer;
     private TextView welcomeStatus;
     private Button welcomePrimary;
@@ -85,7 +87,7 @@ public class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
 
-        FrameLayout root = new FrameLayout(this);
+        root = new FrameLayout(this);
         root.setBackgroundColor(Color.rgb(244, 246, 251));
         web = createWebView();
         root.addView(web, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -129,9 +131,14 @@ public class MainActivity extends Activity {
                 trustedBridgePage = false;
                 showConnectionError();
             }
+            @Override public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                recoverWebViewAfterRendererGone();
+                return true;
+            }
         });
         view.setWebChromeClient(new WebChromeClient() {
             @Override public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                finishFileChooser(null);
                 chooserCallback = callback;
                 String[] types = params.getAcceptTypes();
                 Intent intent;
@@ -149,7 +156,12 @@ public class MainActivity extends Activity {
                     intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
                     if (wantsVisualMedia(types)) intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
                 }
-                startActivityForResult(intent, PICK_FILE);
+                try {
+                    startActivityForResult(intent, PICK_FILE);
+                } catch (Exception error) {
+                    finishFileChooser(null);
+                    Toast.makeText(MainActivity.this, "无法打开文件选择器", Toast.LENGTH_SHORT).show();
+                }
                 return true;
             }
         });
@@ -271,6 +283,22 @@ public class MainActivity extends Activity {
         welcomeLayer.animate().alpha(0f).setDuration(260).withEndAction(() -> welcomeLayer.setVisibility(View.GONE)).start();
     }
 
+    /** A WebView renderer can be reclaimed after a memory-heavy local media preview. It cannot be reused. */
+    private void recoverWebViewAfterRendererGone() {
+        finishFileChooser(null);
+        trustedBridgePage = false;
+        pageLoaded = false;
+        if (root == null) return;
+        if (web != null) {
+            root.removeView(web);
+            web.destroy();
+        }
+        web = createWebView();
+        root.addView(web, 0, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        showLoading("已释放媒体预览内存，正在恢复星桥…");
+        openPreferredEndpoint();
+    }
+
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
@@ -290,15 +318,17 @@ public class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int code, int result, Intent data) {
         super.onActivityResult(code, result, data);
-        if (code != PICK_FILE || chooserCallback == null) return;
+        if (code != PICK_FILE) return;
+        ValueCallback<Uri[]> callback = chooserCallback;
+        chooserCallback = null;
+        if (callback == null) return;
         ArrayList<Uri> uris = new ArrayList<>();
         if (result == RESULT_OK && data != null) {
             if (data.getData() != null) uris.add(data.getData());
             ClipData clip = data.getClipData();
             if (clip != null) for (int i = 0; i < clip.getItemCount(); i++) uris.add(clip.getItemAt(i).getUri());
         }
-        chooserCallback.onReceiveValue(uris.isEmpty() ? null : uris.toArray(new Uri[0]));
-        chooserCallback = null;
+        callback.onReceiveValue(uris.isEmpty() ? null : uris.toArray(new Uri[0]));
     }
 
     @Override public void onBackPressed() {
@@ -307,10 +337,17 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        finishFileChooser(null);
         for (String token : new ArrayList<>(pendingReceives.keySet())) new ShareBridge().abortReceiveFile(token);
         io.shutdownNow();
         if (web != null) web.destroy();
         super.onDestroy();
+    }
+
+    private void finishFileChooser(Uri[] value) {
+        ValueCallback<Uri[]> callback = chooserCallback;
+        chooserCallback = null;
+        if (callback != null) callback.onReceiveValue(value);
     }
 
     final class ShareBridge {

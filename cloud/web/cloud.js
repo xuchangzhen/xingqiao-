@@ -29,6 +29,9 @@ const peers = new Map();
 const pendingCandidates = new Map();
 const receiveFolders = new Map();
 let hostPublishRetry;
+const RENDERED_FILE_LIMIT = 60;
+const META_PREVIEW_LIMIT = 12;
+const IMAGE_PREVIEW_SIZE_LIMIT = 8 * 1024 * 1024;
 
 function escapeHtml(value) { const node = document.createElement("div"); node.textContent = value; return node.innerHTML; }
 function size(bytes) { if (bytes < 1024) return `${bytes} B`; const units = ["KB", "MB", "GB"]; let unit = -1; do { bytes /= 1024; unit++; } while (bytes >= 1024 && unit < 2); return `${bytes.toFixed(bytes < 10 && unit > 0 ? 1 : 0)} ${units[unit]}`; }
@@ -49,18 +52,23 @@ function transferItems() {
   return items;
 }
 
-function localPreview(file) {
-  if (isImage(file)) return `<img class="file-preview" src="${URL.createObjectURL(file)}" alt="${escapeHtml(file.name)}">`;
-  if (isVideo(file)) return `<video class="file-preview" src="${URL.createObjectURL(file)}" muted preload="metadata"></video>`;
+function localPreview(file, allowImagePreview = false) {
+  if (isImage(file) && allowImagePreview && file.size <= IMAGE_PREVIEW_SIZE_LIMIT) return `<img class="file-preview" src="${URL.createObjectURL(file)}" alt="${escapeHtml(file.name)}">`;
+  if (isVideo(file)) return '<span class="file-badge">VID</span>';
   if (file.type.startsWith("text/")) return '<span class="file-badge">TXT</span>';
   return '<span class="file-badge">DOC</span>';
 }
 
 function renderFiles() {
   const items = transferItems();
+  const batchActive = Boolean(state.hosted || state.pendingHost);
   selected.hidden = items.length === 0;
-  selected.innerHTML = items.map((item, position) => `<div class="file-row">${localPreview(item.file)}<span class="file-info"><b>${escapeHtml(item.file.name)}</b><small>${size(item.file.size)}</small></span><button class="remove" data-position="${position}" aria-label="移除" ${state.hosted || state.pendingHost ? "disabled" : ""}>×</button></div>`).join("");
-  $("#sendButton").disabled = !items.length || Boolean(state.hosted || state.pendingHost) || socket?.readyState !== WebSocket.OPEN;
+  const showImagePreviews = items.length <= META_PREVIEW_LIMIT;
+  const visibleItems = items.slice(0, RENDERED_FILE_LIMIT);
+  selected.innerHTML = visibleItems.map((item, position) => `<div class="file-row">${localPreview(item.file, showImagePreviews)}<span class="file-info"><b>${escapeHtml(item.file.name)}</b><small>${size(item.file.size)}</small></span><button class="remove" data-position="${position}" aria-label="移除" ${state.hosted || state.pendingHost ? "disabled" : ""}>×</button></div>`).join("") + (items.length > visibleItems.length ? `<div class="file-more">还有 ${items.length - visibleItems.length} 个文件已加入本批，不生成预览以保证流畅。</div>` : "");
+  selected.querySelectorAll("img.file-preview").forEach(image => image.addEventListener("load", () => URL.revokeObjectURL(image.src), { once: true }));
+  $("#sendButton").disabled = !items.length || batchActive || socket?.readyState !== WebSocket.OPEN;
+  $("#cancelBatch").hidden = !batchActive;
   selected.querySelectorAll(".remove").forEach(button => button.onclick = () => {
     const item = items[Number(button.dataset.position)];
     if (item.source === "clipboardText") { state.clipboardText = ""; $("#clipboardText").value = ""; }
@@ -146,42 +154,51 @@ function pasteClipboardData(clipboardData, appendText = false) {
 async function imageThumbnail(file) {
   return new Promise(resolve => {
     const image = new Image(); const source = URL.createObjectURL(file);
-    image.onload = () => {
-      const scale = Math.min(1, 280 / Math.max(image.width, image.height));
-      const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.round(image.width * scale)); canvas.height = Math.max(1, Math.round(image.height * scale));
-      canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
-      URL.revokeObjectURL(source); resolve(canvas.toDataURL("image/jpeg", 0.72));
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      image.src = "";
+      URL.revokeObjectURL(source);
+      resolve(value);
     };
-    image.onerror = () => { URL.revokeObjectURL(source); resolve(null); };
+    const timer = setTimeout(() => finish(null), 2500);
+    image.onload = () => {
+      try {
+        const scale = Math.min(1, 280 / Math.max(image.width, image.height));
+        const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.round(image.width * scale)); canvas.height = Math.max(1, Math.round(image.height * scale));
+        canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+        finish(canvas.toDataURL("image/jpeg", 0.72));
+      } catch (_) { finish(null); }
+    };
+    image.onerror = () => finish(null);
     image.src = source;
   });
 }
 
-async function videoThumbnail(file) {
-  return new Promise(resolve => {
-    const video = document.createElement("video"); const source = URL.createObjectURL(file);
-    video.muted = true; video.preload = "metadata";
-    const capture = () => {
-      try {
-        const scale = Math.min(1, 280 / Math.max(video.videoWidth || 1, video.videoHeight || 1));
-        const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.round((video.videoWidth || 1) * scale)); canvas.height = Math.max(1, Math.round((video.videoHeight || 1) * scale));
-        canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-        URL.revokeObjectURL(source); resolve(canvas.toDataURL("image/jpeg", 0.72));
-      } catch (_) { URL.revokeObjectURL(source); resolve(null); }
-    };
-    video.onloadeddata = () => { video.currentTime = Math.min(0.1, Math.max(0, (video.duration || 0) / 2)); };
-    video.onseeked = capture;
-    video.onerror = () => { URL.revokeObjectURL(source); resolve(null); };
-    video.src = source;
-  });
+async function fileMeta(file, includePreview) {
+  const meta = { name: file.name, size: file.size, mime: file.type || "application/octet-stream" };
+  // Video frame extraction is expensive and unreliable in Android WebView for large
+  // local files. Videos intentionally use the lightweight VID badge instead.
+  if (!includePreview) return meta;
+  if (isImage(file) && file.size <= IMAGE_PREVIEW_SIZE_LIMIT) {
+    const data = await imageThumbnail(file);
+    if (data) meta.preview = { type: "image", data };
+  } else if (file.type.startsWith("text/") && file.size <= 1024 * 1024) {
+    try { meta.preview = { type: "text", data: (await file.slice(0, 600).text()).trim() }; } catch (_) {}
+  }
+  return meta;
 }
 
-async function fileMeta(file) {
-  const meta = { name: file.name, size: file.size, mime: file.type || "application/octet-stream" };
-  if (isImage(file)) { const data = await imageThumbnail(file); if (data) meta.preview = { type: "image", data }; }
-  else if (file.type.startsWith("text/")) meta.preview = { type: "text", data: (await file.slice(0, 600).text()).trim() };
-  else if (isVideo(file)) { const data = await videoThumbnail(file); if (data) meta.preview = { type: "image", data }; }
-  return meta;
+async function prepareFileMeta(files, pending) {
+  const metadata = [];
+  for (let index = 0; index < files.length; index++) {
+    if (state.pendingHost !== pending) return null;
+    $("#sendButton").innerHTML = `准备传输信息 ${index + 1}/${files.length}…`;
+    metadata.push(await fileMeta(files[index], index < META_PREVIEW_LIMIT));
+  }
+  return metadata;
 }
 
 function preview(meta, localFile) {
@@ -236,15 +253,18 @@ async function host() {
   if (!items.length || state.hosted || state.pendingHost) return;
   state.activeFiles = items.map(item => item.file);
   const room = newRoomCode();
-  state.pendingHost = { room, meta: null };
-  $("#sendButton").innerHTML = "准备预览…";
+  const pending = { room, meta: null };
+  state.pendingHost = pending;
+  $("#sendButton").innerHTML = "准备传输信息…";
   renderFiles();
   try {
-    const files = await Promise.all(state.activeFiles.map(fileMeta));
+    const files = await prepareFileMeta(state.activeFiles, pending);
+    if (!files || state.pendingHost !== pending) return;
     state.hostMeta = { sender: state.device, mode: state.mode, files };
-    state.pendingHost.meta = state.hostMeta;
+    pending.meta = state.hostMeta;
     publishPendingHost();
   } catch (_) {
+    if (state.pendingHost !== pending) return;
     state.activeFiles = [];
     state.hostMeta = null;
     state.pendingHost = null;
@@ -353,6 +373,23 @@ function finishOutgoingBatch(room) {
   $("#sendButton").innerHTML = "开始发送 <i>→</i>";
   renderFiles();
   renderIncoming();
+}
+
+function cancelOutgoingBatch() {
+  const room = state.hosted || state.pendingHost?.room;
+  if (!room) return;
+  send({ type: "leave", room });
+  state.dismissedRooms.add(room);
+  clearTimeout(hostPublishRetry);
+  state.hosted = null;
+  state.pendingHost = null;
+  state.hostMeta = null;
+  state.activeFiles = [];
+  $("#privacy").textContent = "已取消本批；可调整文件后重新点击“开始发送”";
+  $("#sendButton").innerHTML = "开始发送 <i>→</i>";
+  renderFiles();
+  renderIncoming();
+  toast("本批已取消，文件仍保留在发送区");
 }
 
 async function nextAvailableName(folder, name) {
@@ -535,6 +572,7 @@ document.addEventListener("paste", event => {
   if (pasteClipboardData(event.clipboardData, false)) { event.preventDefault(); renderFiles(); toast("已粘贴剪贴板内容"); }
 });
 $("#sendButton").onclick = host;
+$("#cancelBatch").onclick = cancelOutgoingBatch;
 $("#refreshButton").onclick = () => send({ type: "list" });
 window.addEventListener("pagehide", () => {
   clearTimeout(hostPublishRetry);
