@@ -3,9 +3,13 @@ package com.xingqiao.android;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Color;
@@ -16,6 +20,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.OpenableColumns;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
@@ -61,6 +66,7 @@ import java.util.concurrent.Executors;
  */
 public class MainActivity extends Activity {
     private static final int PICK_FILE = 42;
+    private static final int MAX_PICKED_FILES = 40;
     private static final String PREFS = "xingqiao";
     private static final String PREF_ENDPOINT = "endpoint";
 
@@ -73,6 +79,10 @@ public class MainActivity extends Activity {
     private final ArrayList<Uri> pendingSocial = new ArrayList<>();
     private final Map<String, PendingReceive> pendingReceives = new ConcurrentHashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private DownloadManager downloadManager;
+    private long updateDownloadId = -1L;
+    private BroadcastReceiver updateReceiver;
+    private boolean updateInstallPermissionPending;
     private SharedPreferences prefs;
     private boolean pageLoaded;
     private String activeEndpoint;
@@ -94,6 +104,8 @@ public class MainActivity extends Activity {
         welcomeLayer = createWelcome();
         root.addView(welcomeLayer, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(root);
+        downloadManager = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+        registerUpdateReceiver();
 
         readShareIntent(getIntent());
         openPreferredEndpoint();
@@ -148,7 +160,7 @@ public class MainActivity extends Activity {
                     intent.setType("*/*");
                     intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
                     intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-                    intent.putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, MediaStore.getPickImagesMaxLimit());
+                    intent.putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, Math.min(MAX_PICKED_FILES, MediaStore.getPickImagesMaxLimit()));
                 } else {
                     intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
                     intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -306,6 +318,14 @@ public class MainActivity extends Activity {
         if (web != null && pageLoaded) web.reload();
     }
 
+    @Override protected void onResume() {
+        super.onResume();
+        if (updateInstallPermissionPending && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && getPackageManager().canRequestPackageInstalls()) {
+            updateInstallPermissionPending = false;
+            if (updateDownloadId != -1L) openDownloadedUpdate(updateDownloadId);
+        }
+    }
+
     private void readShareIntent(Intent intent) {
         if (!Intent.ACTION_SEND.equals(intent.getAction()) && !Intent.ACTION_SEND_MULTIPLE.equals(intent.getAction())) return;
         Uri one = intent.getParcelableExtra(Intent.EXTRA_STREAM);
@@ -326,8 +346,9 @@ public class MainActivity extends Activity {
         if (result == RESULT_OK && data != null) {
             if (data.getData() != null) uris.add(data.getData());
             ClipData clip = data.getClipData();
-            if (clip != null) for (int i = 0; i < clip.getItemCount(); i++) uris.add(clip.getItemAt(i).getUri());
+            if (clip != null) for (int i = 0; i < clip.getItemCount() && uris.size() < MAX_PICKED_FILES; i++) uris.add(clip.getItemAt(i).getUri());
         }
+        if (uris.size() >= MAX_PICKED_FILES) Toast.makeText(this, "每批最多选择 " + MAX_PICKED_FILES + " 个文件，请分批发送", Toast.LENGTH_LONG).show();
         callback.onReceiveValue(uris.isEmpty() ? null : uris.toArray(new Uri[0]));
     }
 
@@ -339,6 +360,10 @@ public class MainActivity extends Activity {
     @Override protected void onDestroy() {
         finishFileChooser(null);
         for (String token : new ArrayList<>(pendingReceives.keySet())) new ShareBridge().abortReceiveFile(token);
+        if (updateReceiver != null) {
+            try { unregisterReceiver(updateReceiver); } catch (Exception ignored) { }
+            updateReceiver = null;
+        }
         io.shutdownNow();
         if (web != null) web.destroy();
         super.onDestroy();
@@ -350,7 +375,130 @@ public class MainActivity extends Activity {
         if (callback != null) callback.onReceiveValue(value);
     }
 
+    /** The updater is opt-in at build time, so public source never needs a personal release URL. */
+    @SuppressLint("UnspecifiedRegisterReceiverFlag") // Android 12 and lower have no receiver-flag overload.
+    private void registerUpdateReceiver() {
+        updateReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                if (!DownloadManager.ACTION_DOWNLOAD_COMPLETE.equals(intent.getAction())) return;
+                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
+                if (id == updateDownloadId) openDownloadedUpdate(id);
+            }
+        };
+        IntentFilter filter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) registerReceiver(updateReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(updateReceiver, filter);
+    }
+
+    private void checkForUpdate() {
+        final String endpoint = BuildConfig.UPDATE_API_URL == null ? "" : BuildConfig.UPDATE_API_URL.trim();
+        if (endpoint.isEmpty()) { reportUpdate("error", null, "当前安装包未配置更新来源"); return; }
+        reportUpdate("checking", null, null);
+        io.execute(() -> {
+            try {
+                UpdateInfo update = fetchLatestUpdate(endpoint);
+                if (compareVersions(update.version, BuildConfig.VERSION_NAME) <= 0) {
+                    reportUpdate("latest", BuildConfig.VERSION_NAME, null);
+                    return;
+                }
+                enqueueUpdate(update);
+            } catch (Exception error) {
+                reportUpdate("error", null, "检查更新失败，请稍后重试");
+            }
+        });
+    }
+
+    private UpdateInfo fetchLatestUpdate(String endpoint) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
+        connection.setConnectTimeout(10000);
+        connection.setReadTimeout(20000);
+        connection.setRequestProperty("Accept", "application/vnd.github+json");
+        connection.setRequestProperty("User-Agent", "Xingqiao-Android-Updater");
+        if (connection.getResponseCode() / 100 != 2) throw new IOException("更新服务不可用");
+        JSONObject release;
+        try (InputStream input = connection.getInputStream()) { release = new JSONObject(readUtf8(input)); }
+        String version = release.optString("tag_name", "").replaceFirst("^[vV]", "");
+        String download = "";
+        JSONArray assets = release.optJSONArray("assets");
+        if (assets != null) for (int index = 0; index < assets.length(); index++) {
+            JSONObject asset = assets.optJSONObject(index);
+            String name = asset == null ? "" : asset.optString("name", "");
+            if (name.toLowerCase().endsWith(".apk")) { download = asset.optString("browser_download_url", ""); break; }
+        }
+        if (version.isEmpty() || download.isEmpty()) throw new IOException("未找到 Android 安装包");
+        return new UpdateInfo(version, download);
+    }
+
+    private void enqueueUpdate(UpdateInfo update) {
+        runOnUiThread(() -> {
+            try {
+                String name = "xingqiao-update-" + update.version.replaceAll("[^0-9A-Za-z._-]", "_") + ".apk";
+                DownloadManager.Request request = new DownloadManager.Request(Uri.parse(update.downloadUrl));
+                request.setTitle("星桥 v" + update.version);
+                request.setDescription("正在下载更新");
+                request.setMimeType("application/vnd.android.package-archive");
+                request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                request.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, name);
+                updateDownloadId = downloadManager.enqueue(request);
+                reportUpdate("downloading", update.version, null);
+            } catch (Exception error) { reportUpdate("error", null, "无法开始下载更新"); }
+        });
+    }
+
+    private void openDownloadedUpdate(long id) {
+        DownloadManager.Query query = new DownloadManager.Query().setFilterById(id);
+        try (Cursor cursor = downloadManager.query(query)) {
+            if (cursor == null || !cursor.moveToFirst()) { reportUpdate("error", null, "未找到下载的更新"); return; }
+            int status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+            if (status != DownloadManager.STATUS_SUCCESSFUL) { reportUpdate("error", null, "更新下载未完成"); return; }
+        }
+        Uri apk = downloadManager.getUriForDownloadedFile(id);
+        if (apk == null) { reportUpdate("error", null, "无法打开更新安装包"); return; }
+        reportUpdate("ready", null, null);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getPackageManager().canRequestPackageInstalls()) {
+            updateInstallPermissionPending = true;
+            Toast.makeText(this, "请允许星桥安装更新，返回后会自动打开安装确认", Toast.LENGTH_LONG).show();
+            startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+            return;
+        }
+        try {
+            Intent install = new Intent(Intent.ACTION_VIEW)
+                .setDataAndType(apk, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(install);
+        } catch (Exception error) { reportUpdate("error", null, "无法打开系统安装确认"); }
+    }
+
+    private void reportUpdate(String status, String version, String message) {
+        try {
+            JSONObject value = new JSONObject().put("status", status);
+            if (version != null) value.put("version", version);
+            if (message != null) value.put("message", message);
+            String callback = JSONObject.quote(value.toString());
+            runOnUiThread(() -> { if (web != null) web.evaluateJavascript("window.XingqiaoNative&&window.XingqiaoNative.onUpdateStatus(" + callback + ");", null); });
+        } catch (Exception ignored) { }
+    }
+
+    private static int compareVersions(String first, String second) {
+        String[] left = first.replaceFirst("^[vV]", "").split("[.-]");
+        String[] right = second.replaceFirst("^[vV]", "").split("[.-]");
+        int count = Math.max(left.length, right.length);
+        for (int index = 0; index < count; index++) {
+            int a = index < left.length ? numericVersionPart(left[index]) : 0;
+            int b = index < right.length ? numericVersionPart(right[index]) : 0;
+            if (a != b) return a > b ? 1 : -1;
+        }
+        return 0;
+    }
+
+    private static int numericVersionPart(String value) {
+        String digits = value.replaceAll("[^0-9].*$", "");
+        try { return digits.isEmpty() ? 0 : Integer.parseInt(digits); } catch (Exception ignored) { return 0; }
+    }
+
     final class ShareBridge {
+        @android.webkit.JavascriptInterface public void checkForUpdate() { if (isTrustedBridgeCall()) MainActivity.this.checkForUpdate(); }
         @android.webkit.JavascriptInterface public boolean hasPendingSocial() { return !pendingSocial.isEmpty(); }
         @android.webkit.JavascriptInterface public String pendingSocialManifest() {
             if (!isTrustedBridgeCall()) return "{\"files\":[]}";
@@ -559,6 +707,10 @@ public class MainActivity extends Activity {
     private static final class ReceiveDestination {
         final Uri collection; final String relativePath; final String displayFolder;
         ReceiveDestination(Uri collection, String relativePath, String displayFolder) { this.collection = collection; this.relativePath = relativePath; this.displayFolder = displayFolder; }
+    }
+    private static final class UpdateInfo {
+        final String version; final String downloadUrl;
+        UpdateInfo(String version, String downloadUrl) { this.version = version; this.downloadUrl = downloadUrl; }
     }
 
     private static String normalizeEndpoint(String value) {

@@ -11,6 +11,8 @@ const state = {
   hostMeta: null,
   rooms: [],
   received: [],
+  outgoingProgress: null,
+  incomingProgress: new Map(),
   dismissedRooms: new Set(),
 };
 const picker = $("#picker");
@@ -26,15 +28,22 @@ const modes = {
 let socket;
 let iceServers = [];
 const peers = new Map();
+const channels = new Set();
 const pendingCandidates = new Map();
 const receiveFolders = new Map();
 let hostPublishRetry;
 const RENDERED_FILE_LIMIT = 60;
 const META_PREVIEW_LIMIT = 12;
 const IMAGE_PREVIEW_SIZE_LIMIT = 8 * 1024 * 1024;
+const MAX_BATCH_FILES = 40;
+const PROGRESS_PAINT_INTERVAL = 160;
+const RECEIVE_ACK_BYTES = 64 * 1024;
+const MAX_IN_FLIGHT_BYTES = 128 * 1024;
+const BROWSER_FALLBACK_MAX_BYTES = 128 * 1024 * 1024;
 
 function escapeHtml(value) { const node = document.createElement("div"); node.textContent = value; return node.innerHTML; }
 function size(bytes) { if (bytes < 1024) return `${bytes} B`; const units = ["KB", "MB", "GB"]; let unit = -1; do { bytes /= 1024; unit++; } while (bytes >= 1024 && unit < 2); return `${bytes.toFixed(bytes < 10 && unit > 0 ? 1 : 0)} ${units[unit]}`; }
+function speed(bytesPerSecond) { return bytesPerSecond > 0 ? `${size(bytesPerSecond)}/s` : "计算中…"; }
 function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove("show"), 2800); }
 function send(message) {
   if (socket?.readyState !== WebSocket.OPEN) return false;
@@ -44,6 +53,124 @@ function send(message) {
 function newRoomCode() { return Array.from(crypto.getRandomValues(new Uint32Array(3)), n => n.toString(36).padStart(4, "0").slice(-4)).join(""); }
 function isImage(file) { return file.type.startsWith("image/"); }
 function isVideo(file) { return file.type.startsWith("video/"); }
+function canPreviewImage(file) { return !window.AndroidBridge && isImage(file) && file.size <= IMAGE_PREVIEW_SIZE_LIMIT; }
+
+function newTransferProgress(room, files, direction, sender = "") {
+  const now = performance.now();
+  const items = files.map(file => ({ name: file.name, size: Number(file.size) || 0, mime: file.type || file.mime || "application/octet-stream" }));
+  return { room, direction, sender, files: items, totalBytes: items.reduce((total, file) => total + file.size, 0), bytes: 0, totalFiles: items.length, completedFiles: 0, currentName: "", startedAt: now, sampleAt: now, sampleBytes: 0, speed: 0, lastPaint: 0, finished: false };
+}
+
+function progressPercent(progress) {
+  if (!progress.totalBytes) return progress.finished ? 100 : 0;
+  return Math.min(100, Math.round((progress.bytes / progress.totalBytes) * 100));
+}
+
+function progressTitle(progress) {
+  if (progress.finished) return progress.direction === "send" ? "本批发送完成" : "接收完成";
+  const action = progress.direction === "send" ? "正在发送" : "正在接收";
+  const count = progress.totalFiles > 1 ? ` ${Math.min(progress.completedFiles + 1, progress.totalFiles)}/${progress.totalFiles}` : "";
+  return `${action}${count}${progress.currentName ? ` · ${progress.currentName}` : ""}`;
+}
+
+function progressMeta(progress) {
+  return `${size(progress.bytes)} / ${size(progress.totalBytes)} · ${progressPercent(progress)}% · ${progress.finished ? "完成" : speed(progress.speed)}`;
+}
+
+function paintProgress(panel, progress) {
+  if (!panel) return;
+  const title = panel.querySelector("[data-progress-title]");
+  const meta = panel.querySelector("[data-progress-meta]");
+  const bar = panel.querySelector("[data-progress-bar]");
+  if (title) title.textContent = progressTitle(progress);
+  if (meta) meta.textContent = progressMeta(progress);
+  if (bar) bar.style.width = `${progressPercent(progress)}%`;
+}
+
+function renderSendProgress() {
+  const panel = $("#sendProgress");
+  const progress = state.outgoingProgress;
+  panel.hidden = !progress;
+  if (progress) paintProgress(panel, progress);
+}
+
+function progressMarkup(progress) {
+  return `<div class="transfer-progress compact" data-progress-room="${progress.room}"><div class="progress-copy"><b data-progress-title>${escapeHtml(progressTitle(progress))}</b><span data-progress-meta>${escapeHtml(progressMeta(progress))}</span></div><div class="progress-track"><i data-progress-bar style="width:${progressPercent(progress)}%"></i></div></div>`;
+}
+
+function renderIncomingProgress(progress) {
+  const panel = document.querySelector(`[data-progress-room="${progress.room}"]`);
+  if (panel) paintProgress(panel, progress);
+  else renderIncoming();
+}
+
+function recordProgress(progress, bytes, render, force = false) {
+  progress.bytes = Math.min(progress.totalBytes, progress.bytes + bytes);
+  const now = performance.now();
+  if (now - progress.sampleAt >= 400) {
+    progress.speed = (progress.bytes - progress.sampleBytes) * 1000 / (now - progress.sampleAt);
+    progress.sampleAt = now;
+    progress.sampleBytes = progress.bytes;
+  }
+  if (force || now - progress.lastPaint >= PROGRESS_PAINT_INTERVAL) {
+    progress.lastPaint = now;
+    render(progress);
+  }
+}
+
+function beginOutgoingProgress(room, files) {
+  const progress = newTransferProgress(room, files, "send");
+  state.outgoingProgress = progress;
+  renderSendProgress();
+  return progress;
+}
+
+function advanceOutgoingProgress(room, bytes, force = false) {
+  const progress = state.outgoingProgress;
+  if (progress?.room === room) recordProgress(progress, bytes, renderSendProgress, force);
+}
+
+function finishOutgoingProgress(room) {
+  const progress = state.outgoingProgress;
+  if (progress?.room !== room) return;
+  progress.bytes = progress.totalBytes;
+  progress.completedFiles = progress.totalFiles;
+  progress.finished = true;
+  recordProgress(progress, 0, renderSendProgress, true);
+  setTimeout(() => {
+    if (state.outgoingProgress === progress) {
+      state.outgoingProgress = null;
+      renderSendProgress();
+    }
+  }, 3500);
+}
+
+function stopOutgoingProgress(room) {
+  if (state.outgoingProgress?.room === room) {
+    state.outgoingProgress = null;
+    renderSendProgress();
+  }
+}
+
+function advanceIncomingProgress(room, bytes, force = false) {
+  const progress = state.incomingProgress.get(room);
+  if (progress) recordProgress(progress, bytes, renderIncomingProgress, force);
+}
+
+function finishIncomingProgress(room) {
+  const progress = state.incomingProgress.get(room);
+  if (!progress) return;
+  progress.bytes = progress.totalBytes;
+  progress.completedFiles = progress.totalFiles;
+  progress.finished = true;
+  recordProgress(progress, 0, renderIncomingProgress, true);
+  setTimeout(() => {
+    if (state.incomingProgress.get(room) === progress) {
+      state.incomingProgress.delete(room);
+      renderIncoming();
+    }
+  }, 3500);
+}
 
 function transferItems() {
   const items = state.files.map((file, index) => ({ file, source: "files", index }));
@@ -53,7 +180,7 @@ function transferItems() {
 }
 
 function localPreview(file, allowImagePreview = false) {
-  if (isImage(file) && allowImagePreview && file.size <= IMAGE_PREVIEW_SIZE_LIMIT) return `<img class="file-preview" src="${URL.createObjectURL(file)}" alt="${escapeHtml(file.name)}">`;
+  if (canPreviewImage(file) && allowImagePreview) return `<img class="file-preview" src="${URL.createObjectURL(file)}" alt="${escapeHtml(file.name)}">`;
   if (isVideo(file)) return '<span class="file-badge">VID</span>';
   if (file.type.startsWith("text/")) return '<span class="file-badge">TXT</span>';
   return '<span class="file-badge">DOC</span>';
@@ -79,8 +206,11 @@ function renderFiles() {
 
 function addFiles(files) {
   if (queueIsLocked()) return;
-  const allowed = [...files].filter(file => file.size > 0 && file.size <= 4 * 1024 * 1024 * 1024);
-  if (allowed.length !== files.length) toast("已忽略空文件或超过 4 GB 的文件");
+  const valid = [...files].filter(file => file.size > 0 && file.size <= 4 * 1024 * 1024 * 1024);
+  const available = Math.max(0, MAX_BATCH_FILES - state.files.length - state.clipboardImages.length - (state.clipboardText.trim() ? 1 : 0));
+  const allowed = valid.slice(0, available);
+  if (valid.length !== files.length) toast("已忽略空文件或超过 4 GB 的文件");
+  if (allowed.length !== valid.length) toast(`为保证设备流畅，每批最多 ${MAX_BATCH_FILES} 个文件；其余内容请下一批发送`);
   state.files.push(...allowed);
   renderFiles();
 }
@@ -182,7 +312,7 @@ async function fileMeta(file, includePreview) {
   // Video frame extraction is expensive and unreliable in Android WebView for large
   // local files. Videos intentionally use the lightweight VID badge instead.
   if (!includePreview) return meta;
-  if (isImage(file) && file.size <= IMAGE_PREVIEW_SIZE_LIMIT) {
+  if (canPreviewImage(file)) {
     const data = await imageThumbnail(file);
     if (data) meta.preview = { type: "image", data };
   } else if (file.type.startsWith("text/") && file.size <= 1024 * 1024) {
@@ -216,11 +346,21 @@ function rowPreview(meta) {
   return '<span class="file-badge">DOC</span>';
 }
 
+function waitingCard(room) {
+  return `<article class="transfer" data-transfer="${room.room}"><div class="transfer-top"><span class="avatar">✦</span><div><b>${escapeHtml(room.sender)} 正在分享</b><small>${room.files.length} 个文件 · 点对点直连</small></div><button class="primary accept" data-room="${room.room}">接收</button></div><div class="select-row"><label><input class="select-all" type="checkbox" checked> 全部接收</label><span>可勾选需要的文件</span></div><div class="transfer-files">${room.files.map((file, index) => `<label class="receive-file"><input class="receive-check" type="checkbox" data-index="${index}" checked><div class="download">${rowPreview(file)}<strong>${escapeHtml(file.name)}</strong><span>${size(file.size)}</span></div></label>`).join("")}</div><div class="transfer-actions"><button class="decline" data-decline="${room.room}">不接收</button></div></article>`;
+}
+
+function receivingCard(progress) {
+  return `<article class="transfer" data-transfer="${progress.room}"><div class="transfer-top"><span class="avatar">↓</span><div><b>${escapeHtml(progress.sender || "对方设备")} 正在传输</b><small>${progress.totalFiles} 个文件 · 正在写入设备</small></div></div><div class="transfer-files">${progress.files.map(file => `<div class="download">${rowPreview(file)}<strong>${escapeHtml(file.name)}</strong><span>${size(file.size)}</span></div>`).join("")}</div>${progressMarkup(progress)}</article>`;
+}
+
 function renderIncoming() {
   const ownPendingRoom = state.pendingHost?.room;
-  const waiting = state.rooms.filter(room => room.room !== state.hosted && room.room !== ownPendingRoom && !state.dismissedRooms.has(room.room)).map(room => `<article class="transfer" data-transfer="${room.room}"><div class="transfer-top"><span class="avatar">✦</span><div><b>${escapeHtml(room.sender)} 正在分享</b><small>${room.files.length} 个文件 · 点对点直连</small></div><button class="primary accept" data-room="${room.room}">接收</button></div><div class="select-row"><label><input class="select-all" type="checkbox" checked> 全部接收</label><span>可勾选需要的文件</span></div><div class="transfer-files">${room.files.map((file, index) => `<label class="receive-file"><input class="receive-check" type="checkbox" data-index="${index}" checked><div class="download">${rowPreview(file)}<strong>${escapeHtml(file.name)}</strong><span>${size(file.size)}</span></div></label>`).join("")}</div><div class="transfer-actions"><button class="decline" data-decline="${room.room}">不接收</button></div></article>`).join("");
+  const activeRooms = new Set(state.incomingProgress.keys());
+  const receiving = [...state.incomingProgress.values()].map(receivingCard).join("");
+  const waiting = state.rooms.filter(room => room.room !== state.hosted && room.room !== ownPendingRoom && !activeRooms.has(room.room) && !state.dismissedRooms.has(room.room)).map(waitingCard).join("");
   const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.saved ? `已直接保存至“${escapeHtml(file.folder)}”` : "已下载到浏览器默认位置"}</small></div></div>${file.saved ? `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>` : `${preview(file, file)}<div class="transfer-files"><a class="download" draggable="true" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} ↓</span></a></div>`}</article>`).join("");
-  $("#incomingList").innerHTML = waiting || completed ? waiting + completed : '<div class="empty">暂时没有等待接收的内容</div>';
+  $("#incomingList").innerHTML = waiting || receiving || completed ? receiving + waiting + completed : '<div class="empty">暂时没有等待接收的内容</div>';
   document.querySelectorAll(".select-all").forEach(toggle => toggle.onchange = () => toggle.closest(".transfer").querySelectorAll(".receive-check").forEach(box => { box.checked = toggle.checked; }));
   document.querySelectorAll(".receive-check").forEach(box => box.onchange = () => { const card = box.closest(".transfer"); const all = [...card.querySelectorAll(".receive-check")]; card.querySelector(".select-all").checked = all.every(item => item.checked); });
   document.querySelectorAll(".accept").forEach(button => button.onclick = () => acceptFiles(button));
@@ -251,10 +391,16 @@ async function acceptFiles(button) {
       return;
     }
   } else toast("此浏览器不支持选择目录，将保存到浏览器默认下载位置");
+  const source = state.rooms.find(room => room.room === button.dataset.room);
+  const files = selectedIndexes.map(index => source?.files?.[index]).filter(Boolean);
+  if (!folder && !androidAutoSaveAvailable() && files.some(file => file.size > BROWSER_FALLBACK_MAX_BYTES)) {
+    toast("此浏览器不能安全保存超过 128 MB 的文件；请用 Chrome 或 Edge 并选择保存文件夹");
+    return;
+  }
   receiveFolders.set(button.dataset.room, folder);
+  state.incomingProgress.set(button.dataset.room, newTransferProgress(button.dataset.room, files, "receive", source?.sender || "对方设备"));
+  renderIncoming();
   send({ type: "join", room: button.dataset.room, selected: selectedIndexes });
-  button.disabled = true;
-  button.textContent = "连接中…";
   toast("正在建立设备直连…");
 }
 
@@ -312,17 +458,38 @@ function buildPeer(remote, room, selectedIndexes = null) {
 function setupChannel(channel, remote, room, selectedIndexes = null) {
   channel.binaryType = "arraybuffer";
   channel.currentFile = null;
-  channel.selectedIndexes = selectedIndexes;
+  channel.isSender = Array.isArray(selectedIndexes);
+  channel.selectedIndexes = selectedIndexes || [];
+  channel.outgoingFiles = [];
   channel.room = room;
   channel.folder = receiveFolders.get(room) || null;
+  channel.inFlightBytes = 0;
+  channel.receivedSinceAck = 0;
+  channel.ackWaiters = [];
+  channels.add(channel);
   channel.onopen = () => {
-    if (!state.hosted) return;
+    if (!channel.isSender || state.hosted !== room) return;
+    channel.outgoingFiles = state.activeFiles.filter((_, index) => channel.selectedIndexes.includes(index));
+    beginOutgoingProgress(room, channel.outgoingFiles);
     $("#sendButton").innerHTML = "正在传输… <i>●</i>";
     sendFiles(channel).catch(() => toast("传输中断，请保持两个设备都打开星桥后重试"));
   };
   channel.writeQueue = Promise.resolve();
-  channel.onmessage = event => { channel.writeQueue = channel.writeQueue.then(() => receive(channel, event.data)); };
-  channel.onclose = () => toast("设备连接已关闭");
+  channel.onmessage = event => {
+    if (typeof event.data === "string") {
+      const control = readBridgeJson(event.data);
+      if (control?.type === "ack") {
+        releaseRemoteCredit(channel, Number(control.bytes) || 0);
+        return;
+      }
+    }
+    channel.writeQueue = channel.writeQueue.then(() => receive(channel, event.data)).catch(() => stopIncomingChannel(channel, "文件写入失败，已停止传输"));
+  };
+  channel.onclose = () => {
+    channels.delete(channel);
+    wakeAckWaiters(channel);
+    toast("设备连接已关闭");
+  };
 }
 
 async function createOffer(remote, room, selectedIndexes) {
@@ -350,17 +517,79 @@ async function handleSignal(remote, room, payload) {
   }
 }
 
+function wakeAckWaiters(channel) {
+  const waiters = channel.ackWaiters.splice(0);
+  waiters.forEach(resolve => resolve());
+}
+
+function releaseRemoteCredit(channel, bytes) {
+  channel.inFlightBytes = Math.max(0, channel.inFlightBytes - bytes);
+  wakeAckWaiters(channel);
+}
+
+async function waitForRemoteCredit(channel) {
+  if (channel.aborted) throw new Error(channel.abortReason || "接收端已停止传输");
+  while (channel.inFlightBytes >= MAX_IN_FLIGHT_BYTES) {
+    await new Promise(resolve => channel.ackWaiters.push(resolve));
+    if (channel.readyState !== "open" || channel.aborted) throw new Error(channel.abortReason || "连接已关闭");
+  }
+}
+
+async function waitForAllRemoteCredit(channel) {
+  while (channel.inFlightBytes > 0) {
+    await new Promise(resolve => channel.ackWaiters.push(resolve));
+    if (channel.readyState !== "open" || channel.aborted) throw new Error(channel.abortReason || "连接已关闭");
+  }
+}
+
+function acknowledgeReceivedChunk(channel, bytes) {
+  channel.receivedSinceAck += bytes;
+  if (channel.receivedSinceAck >= RECEIVE_ACK_BYTES) flushReceiveAck(channel);
+}
+
+function flushReceiveAck(channel) {
+  if (!channel.receivedSinceAck || channel.readyState !== "open") return;
+  channel.send(JSON.stringify({ type: "ack", bytes: channel.receivedSinceAck }));
+  channel.receivedSinceAck = 0;
+}
+
+function stopIncomingChannel(channel, message) {
+  channel.aborted = true;
+  channel.abortReason = message;
+  if (channel.currentFile?.android?.token) {
+    try { window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token); } catch (_) {}
+  }
+  if (channel.readyState === "open") channel.send(JSON.stringify({ type: "abort", reason: message }));
+  try { channel.close(); } catch (_) {}
+  toast(message);
+}
+
 async function sendFiles(channel) {
-  const files = channel.selectedIndexes ? state.activeFiles.filter((_, index) => channel.selectedIndexes.includes(index)) : state.activeFiles;
+  const files = channel.outgoingFiles;
   for (const file of files) {
+    const progress = state.outgoingProgress;
+    if (progress?.room === channel.room) {
+      progress.currentName = file.name;
+      renderSendProgress();
+    }
     channel.send(JSON.stringify({ type: "file-start", name: file.name, size: file.size, mime: file.type || "application/octet-stream" }));
     for (let offset = 0; offset < file.size; offset += 16 * 1024) {
-      while (channel.bufferedAmount > 4 * 1024 * 1024) await new Promise(resolve => setTimeout(resolve, 25));
-      channel.send(await file.slice(offset, offset + 16 * 1024).arrayBuffer());
+      await waitForRemoteCredit(channel);
+      while (channel.bufferedAmount > 256 * 1024) await new Promise(resolve => setTimeout(resolve, 10));
+      const chunk = await file.slice(offset, offset + 16 * 1024).arrayBuffer();
+      channel.send(chunk);
+      channel.inFlightBytes += chunk.byteLength;
+      advanceOutgoingProgress(channel.room, chunk.byteLength);
     }
     channel.send(JSON.stringify({ type: "file-end" }));
+    if (progress?.room === channel.room) {
+      progress.completedFiles += 1;
+      advanceOutgoingProgress(channel.room, 0, true);
+    }
   }
   channel.send(JSON.stringify({ type: "complete" }));
+  await waitForAllRemoteCredit(channel);
+  finishOutgoingProgress(channel.room);
   finishOutgoingBatch(channel.room);
   toast("内容已通过点对点连接发送");
 }
@@ -389,12 +618,21 @@ function cancelOutgoingBatch() {
   const room = state.hosted || state.pendingHost?.room;
   if (!room) return;
   send({ type: "leave", room });
+  channels.forEach(channel => {
+    if (channel.isSender && channel.room === room) {
+      channel.aborted = true;
+      channel.abortReason = "发送方已取消本批";
+      wakeAckWaiters(channel);
+      try { channel.close(); } catch (_) {}
+    }
+  });
   state.dismissedRooms.add(room);
   clearTimeout(hostPublishRetry);
   state.hosted = null;
   state.pendingHost = null;
   state.hostMeta = null;
   state.activeFiles = [];
+  stopOutgoingProgress(room);
   $("#privacy").textContent = "已取消本批；可调整文件后重新点击“开始发送”";
   $("#sendButton").innerHTML = "开始发送 <i>→</i>";
   renderFiles();
@@ -434,15 +672,35 @@ function finishAndroidSave(token) {
 async function receive(channel, data) {
   if (typeof data === "string") {
     let message; try { message = JSON.parse(data); } catch (_) { return; }
+    if (message.type === "abort") {
+      channel.aborted = true;
+      channel.abortReason = message.reason || "接收端已停止传输";
+      wakeAckWaiters(channel);
+      return;
+    }
     if (message.type === "file-start") {
       channel.currentFile = { name: message.name, size: message.size, mime: message.mime, chunks: [] };
+      const progress = state.incomingProgress.get(channel.room);
+      if (progress) {
+        progress.currentName = message.name;
+        renderIncomingProgress(progress);
+      }
       if (channel.folder) {
-        const name = await nextAvailableName(channel.folder, message.name);
-        const handle = await channel.folder.getFileHandle(name, { create: true });
-        channel.currentFile.writer = await handle.createWritable();
-        channel.currentFile.savedName = name;
+        try {
+          const name = await nextAvailableName(channel.folder, message.name);
+          const handle = await channel.folder.getFileHandle(name, { create: true });
+          channel.currentFile.writer = await handle.createWritable();
+          channel.currentFile.savedName = name;
+        } catch (_) {
+          stopIncomingChannel(channel, "无法写入所选文件夹，已停止传输");
+          return;
+        }
       } else {
         channel.currentFile.android = startAndroidSave(message.name, message.mime);
+        if (androidAutoSaveAvailable() && !channel.currentFile.android) {
+          stopIncomingChannel(channel, "安卓无法创建保存文件，已停止传输");
+          return;
+        }
       }
     }
     if (message.type === "file-end" && channel.currentFile) {
@@ -467,18 +725,32 @@ async function receive(channel, data) {
         toast(`已下载 ${file.name}`);
       }
       channel.currentFile = null;
+      const progress = state.incomingProgress.get(channel.room);
+      if (progress) {
+        progress.completedFiles += 1;
+        advanceIncomingProgress(channel.room, 0, true);
+      }
+      flushReceiveAck(channel);
       renderIncoming();
+    }
+    if (message.type === "complete") {
+      flushReceiveAck(channel);
+      finishIncomingProgress(channel.room);
     }
     return;
   }
+  const bytes = data.byteLength || 0;
   if (channel.currentFile?.writer) await channel.currentFile.writer.write(data);
   else if (channel.currentFile?.android && !channel.currentFile.androidFailed) {
     if (!window.AndroidBridge.writeReceiveChunk(channel.currentFile.android.token, bufferToBase64(data))) {
-      window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token);
       channel.currentFile.androidFailed = true;
-      toast("安卓保存通道中断，请重新接收此文件");
+      stopIncomingChannel(channel, "安卓保存通道中断，已停止传输");
+      return;
     }
   } else if (channel.currentFile && !channel.currentFile.android) channel.currentFile.chunks.push(data);
+  else return;
+  acknowledgeReceivedChunk(channel, bytes);
+  advanceIncomingProgress(channel.room, bytes);
 }
 
 async function connect() {
@@ -547,6 +819,44 @@ function base64ToBytes(value) {
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
   return bytes;
 }
+function updateButton() { return $("#checkUpdate"); }
+function showAndroidUpdate(raw) {
+  const message = readBridgeJson(raw) || raw || {};
+  const button = updateButton();
+  if (!button) return;
+  button.hidden = false;
+  const status = message.status;
+  if (status === "checking") {
+    button.disabled = true;
+    button.textContent = "检查更新中…";
+  } else if (status === "downloading") {
+    button.disabled = true;
+    button.textContent = `下载 v${message.version || ""}…`;
+    toast("正在下载新版本，下载完成后会打开系统安装确认");
+  } else if (status === "ready") {
+    button.disabled = false;
+    button.textContent = "重新检查";
+    toast("安装包已准备好，请在系统安装确认中完成更新");
+  } else if (status === "latest") {
+    button.disabled = false;
+    button.textContent = "已是最新";
+    toast("当前已是最新版本");
+  } else {
+    button.disabled = false;
+    button.textContent = "检查更新";
+    if (message.message) toast(message.message);
+  }
+}
+
+window.XingqiaoNative = { onUpdateStatus: showAndroidUpdate };
+
+function setupAndroidUpdate() {
+  const button = updateButton();
+  if (!button || !window.AndroidBridge?.checkForUpdate) return;
+  button.hidden = false;
+  button.onclick = () => window.AndroidBridge.checkForUpdate();
+}
+
 async function importAndroidSharedFiles() {
   if (!window.AndroidBridge?.hasPendingSocial?.() || !window.AndroidBridge?.pendingSocialManifest || !window.AndroidBridge?.readPendingSocialChunk) return;
   if (queueIsLocked()) return;
@@ -554,8 +864,10 @@ async function importAndroidSharedFiles() {
   if (!manifest?.files?.length) return;
   try {
     setMode("social");
-    for (let index = 0; index < manifest.files.length; index++) {
-      const item = manifest.files[index]; const chunks = [];
+    const limit = Math.max(0, MAX_BATCH_FILES - state.files.length - state.clipboardImages.length - (state.clipboardText.trim() ? 1 : 0));
+    const imports = manifest.files.slice(0, limit);
+    for (let index = 0; index < imports.length; index++) {
+      const item = imports[index]; const chunks = [];
       for (let offset = 0; offset < item.size; offset += 96 * 1024) {
         const chunk = window.AndroidBridge.readPendingSocialChunk(index, offset, Math.min(96 * 1024, item.size - offset));
         if (!chunk) throw new Error(`无法读取 ${item.name}`);
@@ -565,7 +877,7 @@ async function importAndroidSharedFiles() {
     }
     window.AndroidBridge.clearPendingSocial();
     renderFiles();
-    toast("已从社交应用导入，可开始发送");
+    toast(manifest.files.length > imports.length ? `已导入前 ${imports.length} 个文件；其余内容请下一批分享` : "已从社交应用导入，可开始发送");
   } catch (error) { toast(error.message || "社交文件导入失败"); }
 }
 $("#clipboardText").oninput = event => {
@@ -591,3 +903,4 @@ window.addEventListener("pagehide", () => {
   peers.forEach(peer => peer.close());
 });
 setMode("photos"); renderFiles(); importAndroidSharedFiles(); connect();
+setupAndroidUpdate();

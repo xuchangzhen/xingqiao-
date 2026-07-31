@@ -15,6 +15,9 @@
 - Android App 使用系统自适应图标，并将接收内容通过原生 MediaStore 流式写入，避免网页下载策略因设备不同而失效。
 - App 与云端页面均禁用传输逻辑缓存，避免更新后继续运行与原生桥接不兼容的旧网页脚本。
 - 若 Android 系统回收 WebView 的媒体渲染进程，App 会自动创建新的页面实例并恢复到可继续选择文件的状态。
+- Android App 内可“检查更新”：下载 GitHub Release 中的 APK 后交给系统安装确认；首次安装带此功能的版本仍需手动安装一次。
+- 为保护移动设备，Android 不生成大图/视频预览，且每批最多 40 个文件；大批内容请分批发送。
+- 文件传输采用接收端落盘确认的 128 KB 窗口，发送与接收界面都会显示进度、速度和当前文件。
 
 ## 快速使用
 
@@ -61,6 +64,16 @@ cd android
 ```
 
 没有注入入口的开发包会显示“连接其他星桥”高级入口；不会在首次启动时强制要求填写地址。
+
+若要启用应用内更新，还需在签名 Release 构建时注入自己公开仓库的“最新 Release API”地址；此地址同样不会写入仓库。例如：
+
+```bash
+./gradlew assembleRelease \
+  -PXINGQIAO_DEFAULT_WEB_URL=https://transfer.example.com \
+  -PXINGQIAO_UPDATE_API_URL=https://api.github.com/repos/your-org/your-repo/releases/latest
+```
+
+每个 Release 必须上传一个 `.apk` 资产，标签使用递增的 `v1.2.3` 格式。Android 出于安全要求仍会显示系统安装确认；首次更新时也可能要求允许“星桥安装未知应用”。
 
 在 Android 14 上，“相片与视频”会打开系统照片选择器，而不是文件管理器。社交媒体导入遵循系统授权流程：在微信或 QQ 的聊天中选择内容后点“分享”，选择“星桥”；也可以在星桥内点“打开微信/QQ”后手动完成这一步。第三方应用不会向星桥开放聊天列表或让其代替用户勾选聊天文件。
 

@@ -11,6 +11,7 @@ def releaseValue = { name ->
 }
 def hasReleaseSigning = ["storeFile", "storePassword", "keyAlias", "keyPassword"].every { releaseValue(it) }
 def configuredWebUrl = (project.findProperty("XINGQIAO_DEFAULT_WEB_URL") ?: System.getenv("XINGQIAO_DEFAULT_WEB_URL") ?: "").toString().replace("\\", "\\\\").replace("\"", "\\\"")
+def configuredUpdateApiUrl = (project.findProperty("XINGQIAO_UPDATE_API_URL") ?: System.getenv("XINGQIAO_UPDATE_API_URL") ?: "").toString().replace("\\", "\\\\").replace("\"", "\\\"")
 
 android {
     namespace "com.xingqiao.android"
@@ -19,9 +20,10 @@ android {
         applicationId "com.xingqiao.android"
         minSdk 26
         targetSdk 35
-        versionCode 9
-        versionName "1.3.4"
+        versionCode 10
+        versionName "1.3.5"
         buildConfigField "String", "DEFAULT_WEB_URL", "\"${configuredWebUrl}\""
+        buildConfigField "String", "UPDATE_API_URL", "\"${configuredUpdateApiUrl}\""
     }
 
     buildFeatures { buildConfig true }
