@@ -4,7 +4,7 @@
         <package android:name="com.tencent.mm" />
         <package android:name="com.tencent.mobileqq" />
     </queries>
-    <application android:allowBackup="false" android:label="星桥" android:theme="@style/AppTheme" android:usesCleartextTraffic="true">
+    <application android:allowBackup="false" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher" android:label="星桥" android:theme="@style/AppTheme" android:usesCleartextTraffic="true">
         <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

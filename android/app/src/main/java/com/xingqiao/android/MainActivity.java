@@ -72,6 +72,8 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private boolean pageLoaded;
     private String activeEndpoint;
+    /** Written by WebView callbacks on the UI thread, read by the JavaScript bridge thread. */
+    private volatile boolean trustedBridgePage;
 
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     @Override public void onCreate(Bundle state) {
@@ -106,6 +108,7 @@ public class MainActivity extends Activity {
         view.addJavascriptInterface(new ShareBridge(), "AndroidBridge");
         view.setWebViewClient(new WebViewClient() {
             @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                trustedBridgePage = isTrustedPageUrl(url);
                 if (!pageLoaded) showLoading("正在打开星桥…");
             }
             @Override public void onPageFinished(WebView view, String url) {
@@ -114,9 +117,10 @@ public class MainActivity extends Activity {
                 view.evaluateJavascript("document.documentElement.classList.add('xingqiao-android');", null);
             }
             @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                if (request.isForMainFrame()) showConnectionError();
+                if (request.isForMainFrame()) { trustedBridgePage = false; showConnectionError(); }
             }
             @Override @SuppressWarnings("deprecation") public void onReceivedError(WebView view, int code, String description, String failingUrl) {
+                trustedBridgePage = false;
                 showConnectionError();
             }
         });
@@ -216,6 +220,7 @@ public class MainActivity extends Activity {
             return;
         }
         pageLoaded = false;
+        trustedBridgePage = false;
         showLoading("正在建立安全连接…");
         welcomePrimary.setOnClickListener(v -> openPreferredEndpoint());
         web.loadUrl(activeEndpoint);
@@ -470,9 +475,12 @@ public class MainActivity extends Activity {
         return false;
     }
     private boolean isTrustedBridgeCall() {
+        return trustedBridgePage;
+    }
+    private boolean isTrustedPageUrl(String pageUrl) {
         try {
             Uri expected = Uri.parse(activeEndpoint == null ? "" : activeEndpoint);
-            Uri current = Uri.parse(web == null || web.getUrl() == null ? "" : web.getUrl());
+            Uri current = Uri.parse(pageUrl == null ? "" : pageUrl);
             if (expected.getHost() == null || !expected.getHost().equalsIgnoreCase(current.getHost())) return false;
             if ("https".equalsIgnoreCase(current.getScheme())) return true;
             return "http".equalsIgnoreCase(current.getScheme()) && isPrivateHost(current.getHost());
