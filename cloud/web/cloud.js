@@ -14,6 +14,7 @@ const state = {
 const picker = $("#picker");
 const selected = $("#selected");
 const clipboardPanel = $("#clipboardPanel");
+const socialPanel = $("#socialPanel");
 const modes = {
   photos: ["选择相片或视频", "也可将文件拖到这里"],
   files: ["选择文件", "打开文件管理器，或拖到这里"],
@@ -76,8 +77,10 @@ function setMode(mode) {
   $("#dropHint").textContent = hint;
   picker.accept = mode === "photos" ? "image/*,video/*" : "*/*";
   const clipboard = mode === "clipboard";
-  $("#dropzone").hidden = clipboard;
+  const social = mode === "social";
+  $("#dropzone").hidden = clipboard || social;
   clipboardPanel.hidden = !clipboard;
+  socialPanel.hidden = !social;
   $("#privacy").textContent = clipboard ? "剪贴板内容将端到端直传" : "文件不会保存到星桥服务器";
 }
 
@@ -199,7 +202,8 @@ async function acceptFiles(button) {
   if (window.showDirectoryPicker) {
     try { folder = await window.showDirectoryPicker({ mode: "readwrite" }); }
     catch (_) { toast("未选择保存位置，尚未开始接收"); return; }
-  } else toast("此浏览器不支持选择目录，将保存到浏览器默认下载位置");
+  } else if (androidAutoSaveAvailable()) toast("安卓会按文件类型自动保存到星桥目录");
+  else toast("此浏览器不支持选择目录，将保存到浏览器默认下载位置");
   receiveFolders.set(button.dataset.room, folder);
   send({ type: "join", room: button.dataset.room, selected: selectedIndexes });
   button.disabled = true;
@@ -293,6 +297,22 @@ function downloadFallback(blob, name) {
   const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
+function androidAutoSaveAvailable() { return Boolean(window.AndroidBridge?.beginReceiveFile && window.AndroidBridge?.writeReceiveChunk && window.AndroidBridge?.finishReceiveFile); }
+function readBridgeJson(raw) { try { return JSON.parse(raw); } catch (_) { return null; } }
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer); let value = "";
+  for (let offset = 0; offset < bytes.length; offset += 8192) value += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  return btoa(value);
+}
+function startAndroidSave(name, mime) {
+  if (!androidAutoSaveAvailable()) return null;
+  const result = readBridgeJson(window.AndroidBridge.beginReceiveFile(name, mime));
+  return result?.ok ? result : null;
+}
+function finishAndroidSave(token) {
+  return readBridgeJson(window.AndroidBridge.finishReceiveFile(token));
+}
+
 async function receive(channel, data) {
   if (typeof data === "string") {
     let message; try { message = JSON.parse(data); } catch (_) { return; }
@@ -303,6 +323,8 @@ async function receive(channel, data) {
         const handle = await channel.folder.getFileHandle(name, { create: true });
         channel.currentFile.writer = await handle.createWritable();
         channel.currentFile.savedName = name;
+      } else {
+        channel.currentFile.android = startAndroidSave(message.name, message.mime);
       }
     }
     if (message.type === "file-end" && channel.currentFile) {
@@ -311,6 +333,14 @@ async function receive(channel, data) {
         await file.writer.close();
         state.received.push({ ...file, saved: true, folder: channel.folder.name, type: file.mime });
         toast(`已保存 ${file.savedName} 到 ${channel.folder.name}`);
+      } else if (file.android) {
+        if (!file.androidFailed) {
+          const result = finishAndroidSave(file.android.token);
+          if (result?.ok) {
+            state.received.push({ ...file, saved: true, folder: result.folder, type: file.mime });
+            toast(`已自动保存 ${file.name} 到 ${result.folder}`);
+          } else toast(`${file.name} 保存失败，请重新接收`);
+        }
       } else {
         const blob = new Blob(file.chunks, { type: file.mime });
         const url = URL.createObjectURL(blob);
@@ -324,7 +354,13 @@ async function receive(channel, data) {
     return;
   }
   if (channel.currentFile?.writer) await channel.currentFile.writer.write(data);
-  else if (channel.currentFile) channel.currentFile.chunks.push(data);
+  else if (channel.currentFile?.android && !channel.currentFile.androidFailed) {
+    if (!window.AndroidBridge.writeReceiveChunk(channel.currentFile.android.token, bufferToBase64(data))) {
+      window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token);
+      channel.currentFile.androidFailed = true;
+      toast("安卓保存通道中断，请重新接收此文件");
+    }
+  } else if (channel.currentFile && !channel.currentFile.android) channel.currentFile.chunks.push(data);
 }
 
 async function connect() {
@@ -352,6 +388,38 @@ $("#dropzone").ondragover = event => { event.preventDefault(); $("#dropzone").cl
 $("#dropzone").ondragleave = () => $("#dropzone").classList.remove("drag");
 $("#dropzone").ondrop = event => { event.preventDefault(); $("#dropzone").classList.remove("drag"); addFiles(event.dataTransfer.files); };
 $("#pasteClipboard").onclick = readClipboard;
+function openSocialApp(packageName, label) {
+  if (!window.AndroidBridge?.openSocialApp) { toast(`请在${label}聊天中选择文件后，使用“分享”发送到星桥`); return; }
+  window.AndroidBridge.openSocialApp(packageName);
+  toast(`已打开${label}；在聊天中选择文件后点“分享” → “星桥”`);
+}
+$("#openWeChat").onclick = () => openSocialApp("com.tencent.mm", "微信");
+$("#openQQ").onclick = () => openSocialApp("com.tencent.mobileqq", "QQ");
+function base64ToBytes(value) {
+  const binary = atob(value); const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+async function importAndroidSharedFiles() {
+  if (!window.AndroidBridge?.hasPendingSocial?.() || !window.AndroidBridge?.pendingSocialManifest || !window.AndroidBridge?.readPendingSocialChunk) return;
+  const manifest = readBridgeJson(window.AndroidBridge.pendingSocialManifest());
+  if (!manifest?.files?.length) return;
+  try {
+    setMode("social");
+    for (let index = 0; index < manifest.files.length; index++) {
+      const item = manifest.files[index]; const chunks = [];
+      for (let offset = 0; offset < item.size; offset += 96 * 1024) {
+        const chunk = window.AndroidBridge.readPendingSocialChunk(index, offset, Math.min(96 * 1024, item.size - offset));
+        if (!chunk) throw new Error(`无法读取 ${item.name}`);
+        chunks.push(base64ToBytes(chunk));
+      }
+      state.files.push(new File(chunks, item.name, { type: item.mime }));
+    }
+    window.AndroidBridge.clearPendingSocial();
+    renderFiles();
+    toast("已从社交应用导入，可开始发送");
+  } catch (error) { toast(error.message || "社交文件导入失败"); }
+}
 $("#clipboardText").oninput = event => { state.clipboardText = event.target.value; renderFiles(); };
 $("#clipboardText").onpaste = event => {
   event.preventDefault();
@@ -364,4 +432,4 @@ document.addEventListener("paste", event => {
 $("#sendButton").onclick = host;
 $("#refreshButton").onclick = () => send({ type: "list" });
 window.addEventListener("pagehide", () => { if (state.hosted) send({ type: "leave", room: state.hosted }); peers.forEach(peer => peer.close()); });
-setMode("photos"); renderFiles(); connect();
+setMode("photos"); renderFiles(); importAndroidSharedFiles(); connect();

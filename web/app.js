@@ -75,6 +75,38 @@ function renderIncoming(sessions) {
     // Chromium's DownloadURL lets a received item be dropped straight into Finder/Explorer or another app.
     event.dataTransfer.setData("DownloadURL", `${link.dataset.mime}:${link.download}:${new URL(link.href, location.href)}`);
   }));
+  target.querySelectorAll(".download").forEach(link => link.addEventListener("click", event => {
+    if (!androidAutoSaveAvailable()) return;
+    event.preventDefault();
+    saveLinkToAndroid(link);
+  }));
+}
+function androidAutoSaveAvailable() { return Boolean(window.AndroidBridge?.beginReceiveFile && window.AndroidBridge?.writeReceiveChunk && window.AndroidBridge?.finishReceiveFile); }
+function bridgeJson(raw) { try { return JSON.parse(raw); } catch (_) { return null; } }
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer); let value = "";
+  for (let offset = 0; offset < bytes.length; offset += 8192) value += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  return btoa(value);
+}
+async function saveLinkToAndroid(link) {
+  const target = bridgeJson(window.AndroidBridge.beginReceiveFile(link.download, link.dataset.mime || "application/octet-stream"));
+  if (!target?.ok) { toast("无法创建安卓保存位置"); return; }
+  try {
+    const response = await fetch(link.href, { headers: { "X-Xingqiao-Device": deviceId() } });
+    if (!response.ok || !response.body) throw Error("无法读取接收文件");
+    const reader = response.body.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!window.AndroidBridge.writeReceiveChunk(target.token, bufferToBase64(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)))) throw Error("保存通道已中断");
+    }
+    const result = bridgeJson(window.AndroidBridge.finishReceiveFile(target.token));
+    if (!result?.ok) throw Error("保存失败");
+    toast(`已自动保存 ${link.download} 到 ${result.folder}`);
+  } catch (error) {
+    window.AndroidBridge.abortReceiveFile(target.token);
+    toast(error.message || "保存失败");
+  }
 }
 function showSocialChoice() {
   const source = window.prompt("选择导入来源：输入 微信、QQ 或 其他。\n在 Android 上也可先在聊天中点“分享”，选择星桥。", "微信");

@@ -4,14 +4,19 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.OpenableColumns;
+import android.provider.MediaStore;
+import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -29,16 +34,21 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -57,6 +67,7 @@ public class MainActivity extends Activity {
     private Button welcomePrimary;
     private ValueCallback<Uri[]> chooserCallback;
     private final ArrayList<Uri> pendingSocial = new ArrayList<>();
+    private final Map<String, PendingReceive> pendingReceives = new ConcurrentHashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private SharedPreferences prefs;
     private boolean pageLoaded;
@@ -101,7 +112,6 @@ public class MainActivity extends Activity {
                 pageLoaded = true;
                 hideWelcome();
                 view.evaluateJavascript("document.documentElement.classList.add('xingqiao-android');", null);
-                if (!pendingSocial.isEmpty()) Toast.makeText(MainActivity.this, "已接收分享内容，请在网页中选择“社交媒体”发送", Toast.LENGTH_LONG).show();
             }
             @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (request.isForMainFrame()) showConnectionError();
@@ -113,13 +123,21 @@ public class MainActivity extends Activity {
         view.setWebChromeClient(new WebChromeClient() {
             @Override public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
                 chooserCallback = callback;
-                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("*/*");
-                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
                 String[] types = params.getAcceptTypes();
-                if (types != null && types.length > 0 && types[0] != null && (types[0].contains("image") || types[0].contains("video"))) {
+                Intent intent;
+                if (wantsVisualMedia(types) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    // Android 13+ system Photo Picker: this opens the gallery, not DocumentsUI.
+                    intent = new Intent(MediaStore.ACTION_PICK_IMAGES);
+                    intent.setType("*/*");
                     intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
+                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                    intent.putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, MediaStore.getPickImagesMaxLimit());
+                } else {
+                    intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("*/*");
+                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                    if (wantsVisualMedia(types)) intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
                 }
                 startActivityForResult(intent, PICK_FILE);
                 return true;
@@ -278,6 +296,7 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        for (String token : new ArrayList<>(pendingReceives.keySet())) new ShareBridge().abortReceiveFile(token);
         io.shutdownNow();
         if (web != null) web.destroy();
         super.onDestroy();
@@ -285,6 +304,102 @@ public class MainActivity extends Activity {
 
     final class ShareBridge {
         @android.webkit.JavascriptInterface public boolean hasPendingSocial() { return !pendingSocial.isEmpty(); }
+        @android.webkit.JavascriptInterface public String pendingSocialManifest() {
+            if (!isTrustedBridgeCall()) return "{\"files\":[]}";
+            try {
+                JSONArray files = new JSONArray();
+                for (Uri uri : pendingSocial) {
+                    JSONObject item = new JSONObject();
+                    item.put("name", displayName(uri));
+                    item.put("mime", getContentResolver().getType(uri) == null ? "application/octet-stream" : getContentResolver().getType(uri));
+                    item.put("size", displaySize(uri));
+                    files.put(item);
+                }
+                return new JSONObject().put("files", files).toString();
+            } catch (Exception error) { return "{\"files\":[]}"; }
+        }
+        @android.webkit.JavascriptInterface public String readPendingSocialChunk(int index, long offset, int length) {
+            if (!isTrustedBridgeCall() || index < 0 || index >= pendingSocial.size() || length < 1 || length > 96 * 1024) return "";
+            try (java.io.InputStream input = getContentResolver().openInputStream(pendingSocial.get(index))) {
+                if (input == null) return "";
+                long remaining = offset;
+                while (remaining > 0) {
+                    long skipped = input.skip(remaining);
+                    if (skipped > 0) { remaining -= skipped; continue; }
+                    if (input.read() == -1) return "";
+                    remaining--;
+                }
+                byte[] buffer = new byte[length];
+                int count = input.read(buffer);
+                if (count < 1) return "";
+                return Base64.encodeToString(count == buffer.length ? buffer : java.util.Arrays.copyOf(buffer, count), Base64.NO_WRAP);
+            } catch (Exception error) { return ""; }
+        }
+        @android.webkit.JavascriptInterface public void clearPendingSocial() { if (isTrustedBridgeCall()) pendingSocial.clear(); }
+        /** Opens the requested social app; Android intentionally does not expose its chat data. */
+        @android.webkit.JavascriptInterface public void openSocialApp(String packageName) {
+            if (!isTrustedBridgeCall()) return;
+            runOnUiThread(() -> {
+                Intent intent = getPackageManager().getLaunchIntentForPackage(packageName);
+                if (intent == null) { Toast.makeText(MainActivity.this, "未安装该应用", Toast.LENGTH_SHORT).show(); return; }
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(intent);
+            });
+        }
+
+        /** Creates an Android 10+ MediaStore item; WebRTC data is streamed into it by the page. */
+        @android.webkit.JavascriptInterface public String beginReceiveFile(String rawName, String rawMime) {
+            if (!isTrustedBridgeCall() || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "{\"ok\":false}";
+            String name = safeFileName(rawName);
+            String mime = rawMime == null || rawMime.isEmpty() ? "application/octet-stream" : rawMime;
+            try {
+                ReceiveDestination destination = receiveDestination(mime);
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, destination.relativePath);
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                Uri uri = getContentResolver().insert(destination.collection, values);
+                if (uri == null) throw new IOException("无法创建保存位置");
+                OutputStream output = getContentResolver().openOutputStream(uri, "w");
+                if (output == null) { getContentResolver().delete(uri, null, null); throw new IOException("无法写入保存位置"); }
+                String token = UUID.randomUUID().toString();
+                pendingReceives.put(token, new PendingReceive(uri, output, destination.displayFolder));
+                return new JSONObject().put("ok", true).put("token", token).put("folder", destination.displayFolder).toString();
+            } catch (Exception error) { return "{\"ok\":false}"; }
+        }
+
+        @android.webkit.JavascriptInterface public boolean writeReceiveChunk(String token, String base64) {
+            PendingReceive receive = pendingReceives.get(token);
+            if (receive == null) return false;
+            try {
+                receive.output.write(Base64.decode(base64, Base64.NO_WRAP));
+                return true;
+            } catch (Exception error) { abortReceiveFile(token); return false; }
+        }
+
+        @android.webkit.JavascriptInterface public String finishReceiveFile(String token) {
+            PendingReceive receive = pendingReceives.remove(token);
+            if (receive == null) return "{\"ok\":false}";
+            try {
+                receive.output.flush();
+                receive.output.close();
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                getContentResolver().update(receive.uri, values, null, null);
+                return new JSONObject().put("ok", true).put("folder", receive.folder).toString();
+            } catch (Exception error) {
+                try { getContentResolver().delete(receive.uri, null, null); } catch (Exception ignored) { }
+                return "{\"ok\":false}";
+            }
+        }
+
+        @android.webkit.JavascriptInterface public void abortReceiveFile(String token) {
+            PendingReceive receive = pendingReceives.remove(token);
+            if (receive == null) return;
+            try { receive.output.close(); } catch (Exception ignored) { }
+            try { getContentResolver().delete(receive.uri, null, null); } catch (Exception ignored) { }
+        }
         /** Local-network server compatibility: the desktop coordinator accepts this multipart upload. */
         @android.webkit.JavascriptInterface public void uploadPendingSocial(String origin, String sender, String source) {
             final ArrayList<Uri> items = new ArrayList<>(pendingSocial);
@@ -341,7 +456,49 @@ public class MainActivity extends Activity {
         }
         return "shared-file";
     }
+    private long displaySize(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) return cursor.getLong(0);
+        }
+        return 0;
+    }
     private static String escapeJson(String value) { return value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " "); }
+
+    private static boolean wantsVisualMedia(String[] types) {
+        if (types == null) return false;
+        for (String type : types) if (type != null && (type.contains("image") || type.contains("video"))) return true;
+        return false;
+    }
+    private boolean isTrustedBridgeCall() {
+        try {
+            Uri expected = Uri.parse(activeEndpoint == null ? "" : activeEndpoint);
+            Uri current = Uri.parse(web == null || web.getUrl() == null ? "" : web.getUrl());
+            if (expected.getHost() == null || !expected.getHost().equalsIgnoreCase(current.getHost())) return false;
+            if ("https".equalsIgnoreCase(current.getScheme())) return true;
+            return "http".equalsIgnoreCase(current.getScheme()) && isPrivateHost(current.getHost());
+        } catch (Exception ignored) { return false; }
+    }
+    private static boolean isPrivateHost(String host) {
+        return "localhost".equalsIgnoreCase(host) || host.endsWith(".local") || host.startsWith("10.") || host.startsWith("192.168.") || host.matches("^172\\.(1[6-9]|2\\d|3[01])\\..+$");
+    }
+    private static String safeFileName(String name) {
+        String value = name == null ? "" : name.replace('/', '_').replace('\\', '_').replace('\n', ' ').replace('\r', ' ').trim();
+        return value.isEmpty() ? "星桥接收文件" : value;
+    }
+    private static ReceiveDestination receiveDestination(String mime) {
+        if (mime.startsWith("image/")) return new ReceiveDestination(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_PICTURES + "/星桥", "图片 / 星桥");
+        if (mime.startsWith("video/")) return new ReceiveDestination(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MOVIES + "/星桥", "视频 / 星桥");
+        if (mime.startsWith("audio/")) return new ReceiveDestination(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MUSIC + "/星桥", "音乐 / 星桥");
+        return new ReceiveDestination(MediaStore.Downloads.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_DOWNLOADS + "/星桥", "下载 / 星桥");
+    }
+    private static final class PendingReceive {
+        final Uri uri; final OutputStream output; final String folder;
+        PendingReceive(Uri uri, OutputStream output, String folder) { this.uri = uri; this.output = output; this.folder = folder; }
+    }
+    private static final class ReceiveDestination {
+        final Uri collection; final String relativePath; final String displayFolder;
+        ReceiveDestination(Uri collection, String relativePath, String displayFolder) { this.collection = collection; this.relativePath = relativePath; this.displayFolder = displayFolder; }
+    }
 
     private static String normalizeEndpoint(String value) {
         String endpoint = value == null ? "" : value.trim().replaceAll("/+$", "");

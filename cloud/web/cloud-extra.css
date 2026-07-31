@@ -1,6 +1,10 @@
 .mode-grid { grid-template-columns: repeat(4, 1fr); }
 
 .clipboard-panel { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 16px; border: 1px solid #dce7f8; border-radius: 18px; background: #f7faff; }
+.social-panel { display: grid; grid-template-columns: 1fr auto; gap: 14px; padding: 16px; border: 1px solid #dce7f8; border-radius: 18px; background: #f7faff; }
+.social-panel b { font-size: 14px; }
+.social-panel p { margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.social-actions { display: flex; align-items: center; gap: 8px; }
 .clipboard-panel b { font-size: 14px; }
 .clipboard-panel p { margin-top: 4px; color: var(--muted); font-size: 12px; }
 .clipboard-panel textarea { grid-column: 1 / -1; min-height: 92px; resize: vertical; border: 1px solid #d6e0ed; border-radius: 12px; background: #fff; padding: 11px; color: var(--ink); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
@@ -21,4 +25,4 @@
 .receive-file .file-badge { width: 34px; height: 34px; border-radius: 8px; font-size: 10px; }
 
 @media (max-width: 760px) { .mode-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 620px) { .clipboard-panel { grid-template-columns: 1fr; } .clipboard-panel .secondary { justify-self: start; } }
+@media (max-width: 620px) { .clipboard-panel, .social-panel { grid-template-columns: 1fr; } .clipboard-panel .secondary { justify-self: start; } .social-actions { justify-content: flex-start; } }
