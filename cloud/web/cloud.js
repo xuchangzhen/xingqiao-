@@ -37,8 +37,12 @@ const META_PREVIEW_LIMIT = 12;
 const IMAGE_PREVIEW_SIZE_LIMIT = 8 * 1024 * 1024;
 const MAX_BATCH_FILES = 40;
 const PROGRESS_PAINT_INTERVAL = 160;
-const RECEIVE_ACK_BYTES = 64 * 1024;
-const MAX_IN_FLIGHT_BYTES = 128 * 1024;
+// Keep Android's queued WebView/MediaStore work bounded, but leave enough data
+// in flight to fill a normal Wi-Fi link even when WebRTC has a higher RTT.
+const TRANSFER_CHUNK_BYTES = 32 * 1024;
+const RECEIVE_ACK_BYTES = 256 * 1024;
+const MAX_IN_FLIGHT_BYTES = 1024 * 1024;
+const MAX_DATA_CHANNEL_BUFFERED_BYTES = 512 * 1024;
 const BROWSER_FALLBACK_MAX_BYTES = 128 * 1024 * 1024;
 
 function escapeHtml(value) { const node = document.createElement("div"); node.textContent = value; return node.innerHTML; }
@@ -573,10 +577,10 @@ async function sendFiles(channel) {
       renderSendProgress();
     }
     channel.send(JSON.stringify({ type: "file-start", name: file.name, size: file.size, mime: file.type || "application/octet-stream" }));
-    for (let offset = 0; offset < file.size; offset += 16 * 1024) {
+    for (let offset = 0; offset < file.size; offset += TRANSFER_CHUNK_BYTES) {
       await waitForRemoteCredit(channel);
-      while (channel.bufferedAmount > 256 * 1024) await new Promise(resolve => setTimeout(resolve, 10));
-      const chunk = await file.slice(offset, offset + 16 * 1024).arrayBuffer();
+      while (channel.bufferedAmount > MAX_DATA_CHANNEL_BUFFERED_BYTES) await new Promise(resolve => setTimeout(resolve, 10));
+      const chunk = await file.slice(offset, offset + TRANSFER_CHUNK_BYTES).arrayBuffer();
       channel.send(chunk);
       channel.inFlightBytes += chunk.byteLength;
       advanceOutgoingProgress(channel.room, chunk.byteLength);
