@@ -7,6 +7,8 @@ const state = {
   activeFiles: [],
   device: localStorage.getItem("xingqiao-device") || `${navigator.platform.includes("Mac") ? "Mac" : "我的"}设备`,
   hosted: null,
+  pendingHost: null,
+  hostMeta: null,
   rooms: [],
   received: [],
   dismissedRooms: new Set(),
@@ -26,11 +28,16 @@ let iceServers = [];
 const peers = new Map();
 const pendingCandidates = new Map();
 const receiveFolders = new Map();
+let hostPublishRetry;
 
 function escapeHtml(value) { const node = document.createElement("div"); node.textContent = value; return node.innerHTML; }
 function size(bytes) { if (bytes < 1024) return `${bytes} B`; const units = ["KB", "MB", "GB"]; let unit = -1; do { bytes /= 1024; unit++; } while (bytes >= 1024 && unit < 2); return `${bytes.toFixed(bytes < 10 && unit > 0 ? 1 : 0)} ${units[unit]}`; }
 function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove("show"), 2800); }
-function send(message) { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message)); }
+function send(message) {
+  if (socket?.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify(message));
+  return true;
+}
 function newRoomCode() { return Array.from(crypto.getRandomValues(new Uint32Array(3)), n => n.toString(36).padStart(4, "0").slice(-4)).join(""); }
 function isImage(file) { return file.type.startsWith("image/"); }
 function isVideo(file) { return file.type.startsWith("video/"); }
@@ -52,8 +59,8 @@ function localPreview(file) {
 function renderFiles() {
   const items = transferItems();
   selected.hidden = items.length === 0;
-  selected.innerHTML = items.map((item, position) => `<div class="file-row">${localPreview(item.file)}<span class="file-info"><b>${escapeHtml(item.file.name)}</b><small>${size(item.file.size)}</small></span><button class="remove" data-position="${position}" aria-label="移除">×</button></div>`).join("");
-  $("#sendButton").disabled = !items.length || Boolean(state.hosted) || socket?.readyState !== WebSocket.OPEN;
+  selected.innerHTML = items.map((item, position) => `<div class="file-row">${localPreview(item.file)}<span class="file-info"><b>${escapeHtml(item.file.name)}</b><small>${size(item.file.size)}</small></span><button class="remove" data-position="${position}" aria-label="移除" ${state.hosted || state.pendingHost ? "disabled" : ""}>×</button></div>`).join("");
+  $("#sendButton").disabled = !items.length || Boolean(state.hosted || state.pendingHost) || socket?.readyState !== WebSocket.OPEN;
   selected.querySelectorAll(".remove").forEach(button => button.onclick = () => {
     const item = items[Number(button.dataset.position)];
     if (item.source === "clipboardText") { state.clipboardText = ""; $("#clipboardText").value = ""; }
@@ -184,7 +191,8 @@ function rowPreview(meta) {
 }
 
 function renderIncoming() {
-  const waiting = state.rooms.filter(room => room.room !== state.hosted && !state.dismissedRooms.has(room.room)).map(room => `<article class="transfer" data-transfer="${room.room}"><div class="transfer-top"><span class="avatar">✦</span><div><b>${escapeHtml(room.sender)} 正在分享</b><small>${room.files.length} 个文件 · 点对点直连</small></div><button class="primary accept" data-room="${room.room}">接收</button></div><div class="select-row"><label><input class="select-all" type="checkbox" checked> 全部接收</label><span>可勾选需要的文件</span></div><div class="transfer-files">${room.files.map((file, index) => `<label class="receive-file"><input class="receive-check" type="checkbox" data-index="${index}" checked><div class="download">${rowPreview(file)}<strong>${escapeHtml(file.name)}</strong><span>${size(file.size)}</span></div></label>`).join("")}</div><div class="transfer-actions"><button class="decline" data-decline="${room.room}">不接收</button></div></article>`).join("");
+  const ownPendingRoom = state.pendingHost?.room;
+  const waiting = state.rooms.filter(room => room.room !== state.hosted && room.room !== ownPendingRoom && !state.dismissedRooms.has(room.room)).map(room => `<article class="transfer" data-transfer="${room.room}"><div class="transfer-top"><span class="avatar">✦</span><div><b>${escapeHtml(room.sender)} 正在分享</b><small>${room.files.length} 个文件 · 点对点直连</small></div><button class="primary accept" data-room="${room.room}">接收</button></div><div class="select-row"><label><input class="select-all" type="checkbox" checked> 全部接收</label><span>可勾选需要的文件</span></div><div class="transfer-files">${room.files.map((file, index) => `<label class="receive-file"><input class="receive-check" type="checkbox" data-index="${index}" checked><div class="download">${rowPreview(file)}<strong>${escapeHtml(file.name)}</strong><span>${size(file.size)}</span></div></label>`).join("")}</div><div class="transfer-actions"><button class="decline" data-decline="${room.room}">不接收</button></div></article>`).join("");
   const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.saved ? `已直接保存至“${escapeHtml(file.folder)}”` : "已下载到浏览器默认位置"}</small></div></div>${file.saved ? `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>` : `${preview(file, file)}<div class="transfer-files"><a class="download" draggable="true" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} ↓</span></a></div>`}</article>`).join("");
   $("#incomingList").innerHTML = waiting || completed ? waiting + completed : '<div class="empty">暂时没有等待接收的内容</div>';
   document.querySelectorAll(".select-all").forEach(toggle => toggle.onchange = () => toggle.closest(".transfer").querySelectorAll(".receive-check").forEach(box => { box.checked = toggle.checked; }));
@@ -216,16 +224,41 @@ async function acceptFiles(button) {
 
 async function host() {
   const items = transferItems();
-  if (!items.length || state.hosted) return;
+  if (!items.length || state.hosted || state.pendingHost) return;
   state.activeFiles = items.map(item => item.file);
   const room = newRoomCode();
-  state.hosted = room;
+  state.pendingHost = { room, meta: null };
   $("#sendButton").innerHTML = "准备预览…";
   renderFiles();
-  const files = await Promise.all(state.activeFiles.map(fileMeta));
-  send({ type: "host", room, meta: { sender: state.device, mode: state.mode, files } });
-  $("#sendButton").innerHTML = "等待接收 <i>●</i>";
-  $("#privacy").textContent = "保持此页打开；关闭页面会中断传输";
+  try {
+    const files = await Promise.all(state.activeFiles.map(fileMeta));
+    state.hostMeta = { sender: state.device, mode: state.mode, files };
+    state.pendingHost.meta = state.hostMeta;
+    publishPendingHost();
+  } catch (_) {
+    state.activeFiles = [];
+    state.hostMeta = null;
+    state.pendingHost = null;
+    renderFiles();
+    toast("无法准备文件预览，请重新选择后发送");
+  }
+}
+
+function publishPendingHost() {
+  const pending = state.pendingHost;
+  if (!pending) return;
+  if (!pending.meta) return;
+  clearTimeout(hostPublishRetry);
+  if (!send({ type: "host", room: pending.room, meta: pending.meta })) {
+    $("#sendButton").innerHTML = "等待连接… <i>●</i>";
+    $("#privacy").textContent = "连接恢复后会自动开始分享";
+    return;
+  }
+  $("#sendButton").innerHTML = "正在发布… <i>●</i>";
+  $("#privacy").textContent = "正在通知可接收的设备…";
+  hostPublishRetry = setTimeout(() => {
+    if (state.pendingHost === pending) publishPendingHost();
+  }, 3000);
 }
 
 function buildPeer(remote, room, selectedIndexes = null) {
@@ -242,7 +275,11 @@ function setupChannel(channel, remote, room, selectedIndexes = null) {
   channel.currentFile = null;
   channel.selectedIndexes = selectedIndexes;
   channel.folder = receiveFolders.get(room) || null;
-  channel.onopen = () => { if (state.hosted) sendFiles(channel); };
+  channel.onopen = () => {
+    if (!state.hosted) return;
+    $("#sendButton").innerHTML = "正在传输… <i>●</i>";
+    sendFiles(channel).catch(() => toast("传输中断，请保持两个设备都打开星桥后重试"));
+  };
   channel.writeQueue = Promise.resolve();
   channel.onmessage = event => { channel.writeQueue = channel.writeQueue.then(() => receive(channel, event.data)); };
   channel.onclose = () => toast("设备连接已关闭");
@@ -284,6 +321,7 @@ async function sendFiles(channel) {
     channel.send(JSON.stringify({ type: "file-end" }));
   }
   channel.send(JSON.stringify({ type: "complete" }));
+  if (state.hosted) $("#sendButton").innerHTML = "正在分享 <i>●</i>";
   toast("内容已通过点对点连接发送");
 }
 
@@ -369,15 +407,44 @@ async function receive(channel, data) {
 async function connect() {
   try { iceServers = (await fetch("/api/config", { cache: "no-store" }).then(response => response.json())).iceServers || []; } catch (_) {}
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  socket = new WebSocket(`${protocol}://${location.host}/signal`);
-  socket.onopen = () => { $("#privacy").textContent = "已连接：文件将点对点传输"; renderFiles(); send({ type: "list" }); };
-  socket.onmessage = async event => {
+  const activeSocket = new WebSocket(`${protocol}://${location.host}/signal`);
+  socket = activeSocket;
+  activeSocket.onopen = () => {
+    if (socket !== activeSocket) return;
+    $("#privacy").textContent = "已连接：文件将点对点传输";
+    renderFiles();
+    send({ type: "list" });
+    publishPendingHost();
+  };
+  activeSocket.onmessage = async event => {
+    if (socket !== activeSocket) return;
     const message = JSON.parse(event.data);
     if (message.type === "rooms") { state.rooms = message.rooms; renderIncoming(); }
-    if (message.type === "peer-joined" && state.hosted === message.room) createOffer(message.peer, message.room, message.selected);
+    if (message.type === "hosted" && state.pendingHost?.room === message.room) {
+      clearTimeout(hostPublishRetry);
+      state.hosted = message.room;
+      state.pendingHost = null;
+      $("#sendButton").innerHTML = "正在分享 <i>●</i>";
+      $("#privacy").textContent = "正在等待其他设备接收；关闭页面会结束分享";
+      renderFiles();
+      renderIncoming();
+    }
+    if (message.type === "peer-joined" && state.hosted === message.room) {
+      $("#sendButton").innerHTML = "正在传输… <i>●</i>";
+      createOffer(message.peer, message.room, message.selected).catch(() => toast("无法建立设备直连，请确认双方仍在线后重试"));
+    }
     if (message.type === "signal") await handleSignal(message.from, message.room, message.payload);
   };
-  socket.onclose = () => { if (state.hosted) { state.hosted = null; toast("发送会话已因连接中断而结束"); } $("#privacy").textContent = "连接已断开，正在重试…"; renderFiles(); setTimeout(connect, 2000); };
+  activeSocket.onclose = () => {
+    if (socket !== activeSocket) return;
+    clearTimeout(hostPublishRetry);
+    if (state.hosted && state.hostMeta) state.pendingHost = { room: state.hosted, meta: state.hostMeta };
+    state.hosted = null;
+    if (state.pendingHost) $("#sendButton").innerHTML = "连接恢复后继续分享… <i>●</i>";
+    $("#privacy").textContent = "连接已断开，正在重试…";
+    renderFiles();
+    setTimeout(connect, 2000);
+  };
 }
 
 $("#deviceName").textContent = state.device;
@@ -434,5 +501,10 @@ document.addEventListener("paste", event => {
 });
 $("#sendButton").onclick = host;
 $("#refreshButton").onclick = () => send({ type: "list" });
-window.addEventListener("pagehide", () => { if (state.hosted) send({ type: "leave", room: state.hosted }); peers.forEach(peer => peer.close()); });
+window.addEventListener("pagehide", () => {
+  clearTimeout(hostPublishRetry);
+  const room = state.hosted || state.pendingHost?.room;
+  if (room) send({ type: "leave", room });
+  peers.forEach(peer => peer.close());
+});
 setMode("photos"); renderFiles(); importAndroidSharedFiles(); connect();

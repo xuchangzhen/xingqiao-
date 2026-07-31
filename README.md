@@ -67,6 +67,7 @@ cd android
 
 ```bash
 python3 -m unittest -v tests/test_server.py
+python3 -m unittest -v cloud.test_app
 ./android/gradlew -p "$PWD/android" assembleDebug
 ```
 
