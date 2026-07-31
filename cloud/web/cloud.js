@@ -50,13 +50,21 @@ const SPEED_SMOOTHING = 0.28;
 // frames are carved out of a larger read instead of reopening the picker URI
 // thousands of times for a long video.
 const FILE_READ_BLOCK_BYTES = 1024 * 1024;
-const DEFAULT_DATA_CHANNEL_CHUNK_BYTES = 60 * 1024;
-const MAX_DATA_CHANNEL_CHUNK_BYTES = 128 * 1024;
-const RECEIVE_ACK_BYTES = 256 * 1024;
+// Keep Android's receive side deliberately conservative: every packet is
+// eventually copied from WebRTC into WebView and MediaStore. A desktop browser
+// receiving to an explicitly selected folder can safely use substantially
+// larger SCTP messages and a deeper sender queue, which avoids turning a fast
+// Wi-Fi link into thousands of tiny JavaScript/disk writes.
+const ANDROID_DATA_CHANNEL_CHUNK_BYTES = 60 * 1024;
+const BROWSER_DATA_CHANNEL_CHUNK_BYTES = 240 * 1024;
+const MAX_DATA_CHANNEL_CHUNK_BYTES = 256 * 1024;
+const ANDROID_RECEIVE_ACK_BYTES = 256 * 1024;
+const BROWSER_RECEIVE_ACK_BYTES = 1024 * 1024;
+const ANDROID_BINARY_WRITE_BATCH_BYTES = 256 * 1024;
 const ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES = 1024 * 1024;
-const BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
+const BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES = 12 * 1024 * 1024;
 const ANDROID_RECEIVER_BUFFER_HIGH_BYTES = 768 * 1024;
-const BROWSER_RECEIVER_BUFFER_HIGH_BYTES = 2 * 1024 * 1024;
+const BROWSER_RECEIVER_BUFFER_HIGH_BYTES = 6 * 1024 * 1024;
 const BROWSER_FALLBACK_MAX_BYTES = 128 * 1024 * 1024;
 
 function escapeHtml(value) { const node = document.createElement("div"); node.textContent = value; return node.innerHTML; }
@@ -493,9 +501,16 @@ function setupChannel(channel, remote, room, selectedIndexes = null, receiverKin
   channel.inFlightBytes = 0;
   channel.receivedSinceAck = 0;
   channel.ackWaiters = [];
-  channel.maxInFlightBytes = receiverKind === "android" ? ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES : BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES;
-  channel.bufferHighWaterBytes = receiverKind === "android" ? ANDROID_RECEIVER_BUFFER_HIGH_BYTES : BROWSER_RECEIVER_BUFFER_HIGH_BYTES;
+  // `receiverKind` is supplied by the receiver through signalling. For a
+  // channel accepted from a remote sender, derive the local capability instead
+  // so acknowledgement pacing always protects the actual receiving device.
+  channel.remoteReceiverKind = receiverKind;
+  channel.localReceiverKind = androidAutoSaveAvailable() ? "android" : "browser";
+  const sendTargetKind = channel.isSender ? channel.remoteReceiverKind : channel.localReceiverKind;
+  channel.maxInFlightBytes = sendTargetKind === "android" ? ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES : BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES;
+  channel.bufferHighWaterBytes = sendTargetKind === "android" ? ANDROID_RECEIVER_BUFFER_HIGH_BYTES : BROWSER_RECEIVER_BUFFER_HIGH_BYTES;
   channel.bufferLowWaterBytes = Math.floor(channel.bufferHighWaterBytes / 2);
+  channel.receiveAckBytes = channel.localReceiverKind === "android" ? ANDROID_RECEIVE_ACK_BYTES : BROWSER_RECEIVE_ACK_BYTES;
   channel.bufferedAmountLowThreshold = channel.bufferLowWaterBytes;
   channels.add(channel);
   channel.onopen = () => {
@@ -548,14 +563,22 @@ async function showConnectionPath(remote, attempt = 0) {
     const pairName = `${localType} ↔ ${remoteType}`;
     if (localType === "relay" || remoteType === "relay") {
       $("#privacy").textContent = `已连接：公网中转传输（${pairName}，速度受网络影响）`;
-    } else if (localType === "host" && remoteType === "host") {
+    } else if (isPrivateLanCandidate(local) && isPrivateLanCandidate(remoteCandidate)) {
       $("#privacy").textContent = `已连接：局域网直连传输（${pairName}）`;
     } else {
-      $("#privacy").textContent = `已连接：设备点对点直传（${pairName}）`;
+      $("#privacy").textContent = `已连接：设备点对点直传（${pairName}，非中转）`;
     }
   } catch (_) {
     // Transfer itself does not depend on diagnostic statistics being available.
   }
+}
+
+function isPrivateLanCandidate(candidate) {
+  const address = String(candidate?.address || candidate?.ip || "").toLowerCase();
+  if (/^(10\.|192\.168\.|169\.254\.)/.test(address)) return true;
+  const parts = address.match(/^(172)\.(\d+)\./);
+  if (parts && Number(parts[2]) >= 16 && Number(parts[2]) <= 31) return true;
+  return /^(fc|fd|fe[89ab])/.test(address);
 }
 
 async function createOffer(remote, room, selectedIndexes, receiverKind = "browser") {
@@ -609,14 +632,17 @@ async function waitForAllRemoteCredit(channel) {
 }
 
 function dataChannelChunkBytes(channel) {
+  const desired = channel.remoteReceiverKind === "android"
+    ? ANDROID_DATA_CHANNEL_CHUNK_BYTES
+    : BROWSER_DATA_CHANNEL_CHUNK_BYTES;
   const advertised = Number(peers.get(channel.remote)?.sctp?.maxMessageSize);
   if (Number.isFinite(advertised) && advertised > 0) {
     // Leave a small margin for implementations that account SCTP framing in
     // the reported size. The negotiated value is the authoritative limit.
     const safeSize = Math.floor(advertised - 1024);
-    if (safeSize > 0) return Math.min(MAX_DATA_CHANNEL_CHUNK_BYTES, safeSize);
+    if (safeSize > 0) return Math.min(desired, MAX_DATA_CHANNEL_CHUNK_BYTES, safeSize);
   }
-  return DEFAULT_DATA_CHANNEL_CHUNK_BYTES;
+  return desired;
 }
 
 function waitForDataChannelDrain(channel) {
@@ -640,7 +666,7 @@ function waitForDataChannelDrain(channel) {
 
 function acknowledgeReceivedChunk(channel, bytes) {
   channel.receivedSinceAck += bytes;
-  if (channel.receivedSinceAck >= RECEIVE_ACK_BYTES) flushReceiveAck(channel);
+  if (channel.receivedSinceAck >= channel.receiveAckBytes) flushReceiveAck(channel);
 }
 
 function flushReceiveAck(channel) {
@@ -696,9 +722,13 @@ async function sendFilesImpl(channel) {
       const block = await pendingBlock;
       pendingBlock = readNextBlock();
       for (let offset = 0; offset < block.byteLength; offset += chunkSize) {
-        await waitForRemoteCredit(channel);
+        // Avoid creating a microtask for every packet while there is still
+        // remote credit. That scheduling overhead is visible on Android
+        // WebView when a long video contains tens of thousands of packets.
+        if (channel.inFlightBytes >= channel.maxInFlightBytes) await waitForRemoteCredit(channel);
         while (channel.bufferedAmount > channel.bufferHighWaterBytes) await waitForDataChannelDrain(channel);
-        const chunk = block.slice(offset, Math.min(offset + chunkSize, block.byteLength));
+        const end = Math.min(offset + chunkSize, block.byteLength);
+        const chunk = new Uint8Array(block, offset, end - offset);
         channel.send(chunk);
         channel.inFlightBytes += chunk.byteLength;
         advanceOutgoingProgress(channel.room, chunk.byteLength);
@@ -843,6 +873,43 @@ function finishAndroidSave(token) {
   return readBridgeJson(window.AndroidBridge.finishReceiveFile(token));
 }
 
+function mergeArrayBuffers(buffers, byteLength) {
+  if (buffers.length === 1) return buffers[0];
+  const merged = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const buffer of buffers) {
+    const view = new Uint8Array(buffer);
+    merged.set(view, offset);
+    offset += view.byteLength;
+  }
+  return merged.buffer;
+}
+
+/**
+ * Modern Android WebView can pass ArrayBuffers to the native MediaStore bridge
+ * without Base64. Coalesce a few safe WebRTC packets before crossing that
+ * bridge: this removes most UI-thread round trips while retaining the 1 MiB
+ * Android back-pressure limit and bounded memory use.
+ */
+async function flushAndroidBinaryBuffer(channel) {
+  const file = channel.currentFile;
+  if (!file?.android?.binary || !file.androidPendingBytes) return true;
+  const byteLength = file.androidPendingBytes;
+  const payload = mergeArrayBuffers(file.androidPendingBuffers, byteLength);
+  file.androidPendingBuffers = [];
+  file.androidPendingBytes = 0;
+  try {
+    await writeAndroidBinaryChunk(payload);
+  } catch (_) {
+    file.androidFailed = true;
+    stopIncomingChannel(channel, "安卓保存通道中断，已停止传输");
+    return false;
+  }
+  acknowledgeReceivedChunk(channel, byteLength);
+  advanceIncomingProgress(channel.room, byteLength);
+  return true;
+}
+
 async function receive(channel, data) {
   if (typeof data === "string") {
     let message; try { message = JSON.parse(data); } catch (_) { return; }
@@ -877,6 +944,10 @@ async function receive(channel, data) {
           stopIncomingChannel(channel, "安卓无法创建保存文件，已停止传输");
           return;
         }
+        if (channel.currentFile.android?.binary) {
+          channel.currentFile.androidPendingBuffers = [];
+          channel.currentFile.androidPendingBytes = 0;
+        }
       }
     }
     if (message.type === "file-end" && channel.currentFile) {
@@ -887,6 +958,7 @@ async function receive(channel, data) {
         toast(`已保存 ${file.savedName} 到 ${channel.folder.name}`);
       } else if (file.android) {
         if (!file.androidFailed) {
+          if (!await flushAndroidBinaryBuffer(channel)) return;
           const result = finishAndroidSave(file.android.token);
           if (result?.ok) {
             state.received.push({ ...file, saved: true, folder: result.folder, type: file.mime });
@@ -919,11 +991,17 @@ async function receive(channel, data) {
   const bytes = data.byteLength || 0;
   if (channel.currentFile?.writer) await channel.currentFile.writer.write(data);
   else if (channel.currentFile?.android && !channel.currentFile.androidFailed) {
-    try {
-      if (channel.currentFile.android.binary) await writeAndroidBinaryChunk(data);
-      else if (!window.AndroidBridge.writeReceiveChunk(channel.currentFile.android.token, bufferToBase64(data))) throw new Error("安卓保存通道中断");
-    } catch (_) {
-      channel.currentFile.androidFailed = true;
+    const file = channel.currentFile;
+    if (file.android.binary) {
+      file.androidPendingBuffers.push(data);
+      file.androidPendingBytes += bytes;
+      if (file.androidPendingBytes < ANDROID_BINARY_WRITE_BATCH_BYTES) return;
+      await flushAndroidBinaryBuffer(channel);
+      return;
+    }
+    try { if (!window.AndroidBridge.writeReceiveChunk(file.android.token, bufferToBase64(data))) throw new Error("安卓保存通道中断"); }
+    catch (_) {
+      file.androidFailed = true;
       stopIncomingChannel(channel, "安卓保存通道中断，已停止传输");
       return;
     }
