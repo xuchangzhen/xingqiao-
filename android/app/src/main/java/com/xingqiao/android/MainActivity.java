@@ -38,8 +38,10 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -451,9 +453,17 @@ public class MainActivity extends Activity {
             out.writeBytes("--" + boundary + "--\r\n");
         }
         if (connection.getResponseCode() / 100 != 2) throw new IOException("服务拒绝了文件（" + connection.getResponseCode() + "）");
-        try (java.io.InputStream input = connection.getInputStream()) {
-            return new JSONObject(new String(input.readAllBytes(), StandardCharsets.UTF_8));
+        try (InputStream input = connection.getInputStream()) {
+            return new JSONObject(readUtf8(input));
         }
+    }
+
+    /** InputStream.readAllBytes was added only in Android 13; keep the upload reply reader compatible with minSdk 26. */
+    private static String readUtf8(InputStream input) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8 * 1024];
+        for (int count; (count = input.read(buffer)) != -1;) output.write(buffer, 0, count);
+        return new String(output.toByteArray(), StandardCharsets.UTF_8);
     }
 
     private void field(DataOutputStream out, String boundary, String name, String value) throws IOException {
@@ -497,6 +507,8 @@ public class MainActivity extends Activity {
         String value = name == null ? "" : name.replace('/', '_').replace('\\', '_').replace('\n', ' ').replace('\r', ' ').trim();
         return value.isEmpty() ? "星桥接收文件" : value;
     }
+    // This helper is only reached by beginReceiveFile after its Android 10 guard.
+    @android.annotation.TargetApi(Build.VERSION_CODES.Q)
     private static ReceiveDestination receiveDestination(String mime) {
         if (mime.startsWith("image/")) return new ReceiveDestination(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_PICTURES + "/星桥", "图片 / 星桥");
         if (mime.startsWith("video/")) return new ReceiveDestination(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MOVIES + "/星桥", "视频 / 星桥");
