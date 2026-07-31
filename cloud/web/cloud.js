@@ -41,6 +41,7 @@ const META_PREVIEW_LIMIT = 12;
 const IMAGE_PREVIEW_SIZE_LIMIT = 8 * 1024 * 1024;
 const MAX_BATCH_FILES = 40;
 const PROGRESS_PAINT_INTERVAL = 160;
+const SPEED_SMOOTHING = 0.28;
 // Keep Android's queued WebView/MediaStore work bounded, but leave enough data
 // in flight to fill a normal Wi-Fi link even when WebRTC has a higher RTT.
 // Read Android content URIs in larger blocks. Android WebView pays a noticeable
@@ -122,8 +123,11 @@ function renderIncomingProgress(progress) {
 function recordProgress(progress, bytes, render, force = false) {
   progress.bytes = Math.min(progress.totalBytes, progress.bytes + bytes);
   const now = performance.now();
-  if (now - progress.sampleAt >= 400) {
-    progress.speed = (progress.bytes - progress.sampleBytes) * 1000 / (now - progress.sampleAt);
+  if (now - progress.sampleAt >= 300) {
+    const instantaneous = (progress.bytes - progress.sampleBytes) * 1000 / (now - progress.sampleAt);
+    progress.speed = progress.speed > 0
+      ? progress.speed * (1 - SPEED_SMOOTHING) + instantaneous * SPEED_SMOOTHING
+      : instantaneous;
     progress.sampleAt = now;
     progress.sampleBytes = progress.bytes;
   }
@@ -656,8 +660,19 @@ async function sendFiles(channel) {
     }
     channel.send(JSON.stringify({ type: "file-start", name: file.name, size: file.size, mime: file.type || "application/octet-stream" }));
     const chunkSize = dataChannelChunkBytes(channel);
-    for (let readOffset = 0; readOffset < file.size; readOffset += FILE_READ_BLOCK_BYTES) {
-      const block = await file.slice(readOffset, readOffset + FILE_READ_BLOCK_BYTES).arrayBuffer();
+    let readOffset = 0;
+    const readNextBlock = () => {
+      if (readOffset >= file.size) return null;
+      const start = readOffset;
+      readOffset += FILE_READ_BLOCK_BYTES;
+      return file.slice(start, start + FILE_READ_BLOCK_BYTES).arrayBuffer();
+    };
+    // Keep exactly one block ahead of the network. This hides MediaStore / WebView
+    // read latency without allowing a large video to accumulate in memory.
+    let pendingBlock = readNextBlock();
+    while (pendingBlock) {
+      const block = await pendingBlock;
+      pendingBlock = readNextBlock();
       for (let offset = 0; offset < block.byteLength; offset += chunkSize) {
         await waitForRemoteCredit(channel);
         while (channel.bufferedAmount > MAX_DATA_CHANNEL_BUFFERED_BYTES) await waitForDataChannelDrain(channel);
