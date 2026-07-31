@@ -70,10 +70,17 @@ function renderFiles() {
 }
 
 function addFiles(files) {
+  if (queueIsLocked()) return;
   const allowed = [...files].filter(file => file.size > 0 && file.size <= 4 * 1024 * 1024 * 1024);
   if (allowed.length !== files.length) toast("已忽略空文件或超过 4 GB 的文件");
   state.files.push(...allowed);
   renderFiles();
+}
+
+function queueIsLocked() {
+  if (!state.hosted && !state.pendingHost) return false;
+  toast("当前批次正在分享；本批完成后请重新选择文件并点击“开始发送”");
+  return true;
 }
 
 function setMode(mode) {
@@ -92,6 +99,7 @@ function setMode(mode) {
 }
 
 async function readClipboard() {
+  if (queueIsLocked()) return;
   try {
     if (!navigator.clipboard?.read) throw new Error("当前浏览器只支持直接粘贴");
     const entries = await navigator.clipboard.read();
@@ -116,6 +124,7 @@ async function readClipboard() {
 }
 
 function pasteClipboardData(clipboardData, appendText = false) {
+  if (queueIsLocked()) return 0;
   let added = 0;
   const text = clipboardData.getData("text/plain");
   if (text) {
@@ -274,6 +283,7 @@ function setupChannel(channel, remote, room, selectedIndexes = null) {
   channel.binaryType = "arraybuffer";
   channel.currentFile = null;
   channel.selectedIndexes = selectedIndexes;
+  channel.room = room;
   channel.folder = receiveFolders.get(room) || null;
   channel.onopen = () => {
     if (!state.hosted) return;
@@ -321,8 +331,28 @@ async function sendFiles(channel) {
     channel.send(JSON.stringify({ type: "file-end" }));
   }
   channel.send(JSON.stringify({ type: "complete" }));
-  if (state.hosted) $("#sendButton").innerHTML = "正在分享 <i>●</i>";
+  finishOutgoingBatch(channel.room);
   toast("内容已通过点对点连接发送");
+}
+
+function finishOutgoingBatch(room) {
+  if (state.hosted !== room) return;
+  // Each press of “开始发送” creates one immutable batch. Do not let files
+  // selected later silently appear in the sender UI without being advertised.
+  send({ type: "leave", room });
+  state.dismissedRooms.add(room);
+  state.hosted = null;
+  state.pendingHost = null;
+  state.hostMeta = null;
+  state.activeFiles = [];
+  state.files = [];
+  state.clipboardImages = [];
+  state.clipboardText = "";
+  $("#clipboardText").value = "";
+  $("#privacy").textContent = "本批已发送完成；请选择下一批文件后再次点击“开始发送”";
+  $("#sendButton").innerHTML = "开始发送 <i>→</i>";
+  renderFiles();
+  renderIncoming();
 }
 
 async function nextAvailableName(folder, name) {
@@ -472,6 +502,7 @@ function base64ToBytes(value) {
 }
 async function importAndroidSharedFiles() {
   if (!window.AndroidBridge?.hasPendingSocial?.() || !window.AndroidBridge?.pendingSocialManifest || !window.AndroidBridge?.readPendingSocialChunk) return;
+  if (queueIsLocked()) return;
   const manifest = readBridgeJson(window.AndroidBridge.pendingSocialManifest());
   if (!manifest?.files?.length) return;
   try {
@@ -490,7 +521,11 @@ async function importAndroidSharedFiles() {
     toast("已从社交应用导入，可开始发送");
   } catch (error) { toast(error.message || "社交文件导入失败"); }
 }
-$("#clipboardText").oninput = event => { state.clipboardText = event.target.value; renderFiles(); };
+$("#clipboardText").oninput = event => {
+  if (queueIsLocked()) { event.target.value = state.clipboardText; return; }
+  state.clipboardText = event.target.value;
+  renderFiles();
+};
 $("#clipboardText").onpaste = event => {
   event.preventDefault();
   if (pasteClipboardData(event.clipboardData, true)) renderFiles();
