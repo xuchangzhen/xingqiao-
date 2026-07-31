@@ -199,11 +199,14 @@ async function acceptFiles(button) {
   const selectedIndexes = [...card.querySelectorAll(".receive-check:checked")].map(box => Number(box.dataset.index));
   if (!selectedIndexes.length) { toast("请先选择至少一个文件"); return; }
   let folder = null;
-  if (window.showDirectoryPicker) {
+  // Some Android WebViews expose showDirectoryPicker but cannot complete it.
+  // Prefer the native MediaStore bridge before probing browser-only directory APIs.
+  if (androidAutoSaveAvailable()) {
+    toast("安卓会按文件类型自动保存到星桥目录");
+  } else if (window.showDirectoryPicker) {
     try { folder = await window.showDirectoryPicker({ mode: "readwrite" }); }
     catch (_) { toast("未选择保存位置，尚未开始接收"); return; }
-  } else if (androidAutoSaveAvailable()) toast("安卓会按文件类型自动保存到星桥目录");
-  else toast("此浏览器不支持选择目录，将保存到浏览器默认下载位置");
+  } else toast("此浏览器不支持选择目录，将保存到浏览器默认下载位置");
   receiveFolders.set(button.dataset.room, folder);
   send({ type: "join", room: button.dataset.room, selected: selectedIndexes });
   button.disabled = true;
@@ -391,7 +394,7 @@ $("#pasteClipboard").onclick = readClipboard;
 function openSocialApp(packageName, label) {
   if (!window.AndroidBridge?.openSocialApp) { toast(`请在${label}聊天中选择文件后，使用“分享”发送到星桥`); return; }
   window.AndroidBridge.openSocialApp(packageName);
-  toast(`已打开${label}；在聊天中选择文件后点“分享” → “星桥”`);
+  toast(`已打开${label}；选择内容后用“分享” → “星桥”，若没有分享项请先保存到手机`);
 }
 $("#openWeChat").onclick = () => openSocialApp("com.tencent.mm", "微信");
 $("#openQQ").onclick = () => openSocialApp("com.tencent.mobileqq", "QQ");
