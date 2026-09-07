@@ -1,6 +1,8 @@
 using Microsoft.Web.WebView2.Core;
 using System.Diagnostics;
+using System.IO;
 using System.Windows;
+using WpfMessageBox = System.Windows.MessageBox;
 
 namespace XingqiaoDesktop;
 
@@ -35,7 +37,7 @@ public partial class MainWindow : Window
         }
         catch (Exception error)
         {
-            MessageBox.Show($"无法启动网页界面：{error.Message}\n\n请确认 Microsoft Edge WebView2 Runtime 已安装。", "星桥", MessageBoxButton.OK, MessageBoxImage.Error);
+            WpfMessageBox.Show($"无法启动网页界面：{error.Message}\n\n请确认 Microsoft Edge WebView2 Runtime 已安装。", "星桥", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 

@@ -18,5 +18,6 @@ desktop/macos/Assets.iconset/
 desktop/windows/bin/
 desktop/windows/obj/
 desktop/windows/dist/
+desktop/windows/.nuget/
 xingqiao-cloud.tar.gz
 社交媒体选择文件示例/
