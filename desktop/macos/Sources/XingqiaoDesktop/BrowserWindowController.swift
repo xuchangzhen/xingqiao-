@@ -4,15 +4,10 @@ import WebKit
 @MainActor
 final class BrowserWindowController: NSWindowController, WKNavigationDelegate, NSWindowDelegate {
     private let bridge: DesktopBridge
-    private let webView: WKWebView
-    private let dragOverlay: NativeFileDragOverlayView
+    private let webView: NativeFileDragWebView
     private var endpoint: URL?
 
     init(store: TempInboxStore, shelf: InboxPanelController) {
-        dragOverlay = NativeFileDragOverlayView(
-            fileURL: { id in store.file(id: id)?.path },
-            didClick: { shelf.show() }
-        )
         bridge = DesktopBridge(store: store, shelf: shelf)
         let configuration = WKWebViewConfiguration()
         // The web shell always comes from the deployed endpoint. A non-persistent
@@ -29,7 +24,12 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         ))
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = NativeFileDragWebView(
+            frame: .zero,
+            configuration: configuration,
+            fileURL: { id in store.file(id: id)?.path },
+            didClick: { shelf.show() }
+        )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1060, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -40,23 +40,17 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
         window.minSize = NSSize(width: 720, height: 560)
         super.init(window: window)
         webView.translatesAutoresizingMaskIntoConstraints = false
-        dragOverlay.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = NSView()
         window.contentView?.addSubview(webView)
-        window.contentView?.addSubview(dragOverlay)
         NSLayoutConstraint.activate([
             webView.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
             webView.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
             webView.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
-            dragOverlay.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
-            dragOverlay.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
-            dragOverlay.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
-            dragOverlay.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
         ])
         webView.navigationDelegate = self
         window.delegate = self
-        bridge.nativeDragTargetHandler = { [weak self] targets in self?.dragOverlay.update(targets: targets) }
+        bridge.nativeDragTargetHandler = { [weak self] targets in self?.webView.updateNativeDragTargets(targets) }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -150,7 +144,7 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
     private func load(_ url: URL) {
         endpoint = url
         bridge.trustedOrigin = nil
-        dragOverlay.update(targets: [])
+        webView.updateNativeDragTargets([])
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         var query = components?.queryItems ?? []
         query.append(URLQueryItem(name: "xingqiao_desktop", value: "1"))
@@ -235,8 +229,9 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
             case "setTransferActive":
                 replyHandler(true, nil)
             case "syncNativeDragTargets":
-                nativeDragTargetHandler?(nativeTargets(from: body["targets"]))
-                replyHandler(true, nil)
+                let targets = nativeTargets(from: body["targets"])
+                nativeDragTargetHandler?(targets)
+                replyHandler(["ok": true, "mapped": targets.count], nil)
             default:
                 replyHandler(["ok": false, "error": "未知请求"], nil)
             }
