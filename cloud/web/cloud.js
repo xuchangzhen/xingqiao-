@@ -49,23 +49,32 @@ const SPEED_SMOOTHING = 0.28;
 // scheduling cost for every File.slice().arrayBuffer() call, so small network
 // frames are carved out of a larger read instead of reopening the picker URI
 // thousands of times for a long video.
-const FILE_READ_BLOCK_BYTES = 1024 * 1024;
+const ANDROID_FILE_READ_BLOCK_BYTES = 1024 * 1024;
+const BROWSER_FILE_READ_BLOCK_BYTES = 8 * 1024 * 1024;
 // Keep Android's receive side deliberately conservative: every packet is
 // eventually copied from WebRTC into WebView and MediaStore. A desktop browser
-// receiving to an explicitly selected folder can safely use substantially
-// larger SCTP messages and a deeper sender queue, which avoids turning a fast
-// Wi-Fi link into thousands of tiny JavaScript/disk writes.
+// receiving to an explicitly selected folder can safely use a deeper sender
+// queue. Keep individual SCTP messages near 64 KiB to avoid costly large-message
+// fragmentation; disk writes are coalesced separately below.
 const ANDROID_DATA_CHANNEL_CHUNK_BYTES = 60 * 1024;
-const BROWSER_DATA_CHANNEL_CHUNK_BYTES = 240 * 1024;
-const MAX_DATA_CHANNEL_CHUNK_BYTES = 256 * 1024;
+const BROWSER_DATA_CHANNEL_CHUNK_BYTES = 64 * 1024;
+const MAX_DATA_CHANNEL_CHUNK_BYTES = 64 * 1024;
 const ANDROID_RECEIVE_ACK_BYTES = 256 * 1024;
-const BROWSER_RECEIVE_ACK_BYTES = 1024 * 1024;
+const BROWSER_RECEIVE_ACK_BYTES = 4 * 1024 * 1024;
 const ANDROID_BINARY_WRITE_BATCH_BYTES = 256 * 1024;
+const BROWSER_WRITABLE_BATCH_BYTES = 4 * 1024 * 1024;
 const ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES = 1024 * 1024;
-const BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES = 12 * 1024 * 1024;
+const BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES = 32 * 1024 * 1024;
 const ANDROID_RECEIVER_BUFFER_HIGH_BYTES = 768 * 1024;
+// Chromium's per-channel send queue is commonly capped near 16 MiB. Leave
+// generous headroom so a single send() can never trip that hard limit.
 const BROWSER_RECEIVER_BUFFER_HIGH_BYTES = 6 * 1024 * 1024;
 const BROWSER_FALLBACK_MAX_BYTES = 128 * 1024 * 1024;
+const DIRECT_DRAG_CACHE = "xingqiao-direct-drag-v1";
+const DIRECT_DRAG_PATH = "/_xingqiao_drag/";
+const DIRECT_DRAG_LIFETIME_MS = 15 * 60 * 1000;
+const directDragUrls = new Set();
+let directDragWorker;
 
 function escapeHtml(value) { const node = document.createElement("div"); node.textContent = value; return node.innerHTML; }
 function size(bytes) { if (bytes < 1024) return `${bytes} B`; const units = ["KB", "MB", "GB"]; let unit = -1; do { bytes /= 1024; unit++; } while (bytes >= 1024 && unit < 2); return `${bytes.toFixed(bytes < 10 && unit > 0 ? 1 : 0)} ${units[unit]}`; }
@@ -80,6 +89,30 @@ function newRoomCode() { return Array.from(crypto.getRandomValues(new Uint32Arra
 function isImage(file) { return file.type.startsWith("image/"); }
 function isVideo(file) { return file.type.startsWith("video/"); }
 function canPreviewImage(file) { return !window.AndroidBridge && isImage(file) && file.size <= IMAGE_PREVIEW_SIZE_LIMIT; }
+
+function addReceivedDragData(event, link, received) {
+  const transfer = event.dataTransfer;
+  if (!transfer || !received?.resource) return;
+  transfer.effectAllowed = "copy";
+  // A real File item is consumable by browser editors, upload areas and apps
+  // that accept file drops. Chromium's DownloadURL additionally supports
+  // dragging the same in-memory resource straight to Finder / Explorer.
+  try { transfer.items?.add(received.resource); } catch (_) {}
+  // A native app cannot dereference blob: URLs from this renderer. The
+  // temporary same-origin URL is handled by drag-worker.js, which returns the
+  // received File from Cache Storage as Chromium materializes the drop.
+  const url = new URL(link.dataset.dragUrl || link.href, location.href).href;
+  const name = received.name.replaceAll(":", "_");
+  try { transfer.setData("DownloadURL", `${received.mime}:${name}:${url}`); } catch (_) {}
+  try { transfer.setData("text/uri-list", url); } catch (_) {}
+  try { transfer.setData("text/plain", received.name); } catch (_) {}
+  if (received.mime.startsWith("image/")) {
+    const image = document.createElement("img");
+    image.src = url;
+    image.alt = received.name;
+    try { transfer.setData("text/html", image.outerHTML); } catch (_) {}
+  }
+}
 
 function newTransferProgress(room, files, direction, sender = "") {
   const now = performance.now();
@@ -360,8 +393,13 @@ async function prepareFileMeta(files, pending) {
   return metadata;
 }
 
-function preview(meta, localFile) {
-  if (localFile && isImage(localFile)) return `<div class="transfer-preview"><img class="file-preview" src="${localFile.url || URL.createObjectURL(localFile)}" alt="${escapeHtml(localFile.name)}"></div>`;
+function preview(meta, localFile, receivedId = "", dragUrl = "") {
+  if (localFile && isImage(localFile)) {
+    const source = localFile.url || URL.createObjectURL(localFile);
+    const image = `<img class="file-preview" src="${source}" alt="${escapeHtml(localFile.name)}">`;
+    if (receivedId) return `<a class="transfer-preview received-preview-link" draggable="true" data-received-id="${receivedId}" data-drag-url="${dragUrl || source}" data-mime="${escapeHtml(localFile.mime || localFile.type || "image/*")}" href="${source}" download="${escapeHtml(localFile.name)}" title="拖动这张预览图即可交给聊天窗口、网页上传区或桌面">${image}<span>拖动预览图，直接使用</span></a>`;
+    return `<div class="transfer-preview">${image}</div>`;
+  }
   if (localFile && isVideo(localFile)) return `<div class="transfer-preview"><video class="file-preview" src="${localFile.url || URL.createObjectURL(localFile)}" controls preload="metadata"></video></div>`;
   if (meta.preview?.type === "image") return `<div class="transfer-preview"><img class="file-preview" src="${meta.preview.data}" alt="${escapeHtml(meta.name)}"></div>`;
   if (meta.preview?.type === "text" && meta.preview.data) return `<div class="transfer-preview"><div class="text-preview">${escapeHtml(meta.preview.data)}</div></div>`;
@@ -376,7 +414,7 @@ function rowPreview(meta) {
 }
 
 function waitingCard(room) {
-  return `<article class="transfer" data-transfer="${room.room}"><div class="transfer-top"><span class="avatar">✦</span><div><b>${escapeHtml(room.sender)} 正在分享</b><small>${room.files.length} 个文件 · 点对点直连</small></div><button class="primary accept" data-room="${room.room}">接收</button></div><div class="select-row"><label><input class="select-all" type="checkbox" checked> 全部接收</label><span>可勾选需要的文件</span></div><div class="transfer-files">${room.files.map((file, index) => `<label class="receive-file"><input class="receive-check" type="checkbox" data-index="${index}" checked><div class="download">${rowPreview(file)}<strong>${escapeHtml(file.name)}</strong><span>${size(file.size)}</span></div></label>`).join("")}</div><div class="transfer-actions"><button class="decline" data-decline="${room.room}">不接收</button></div></article>`;
+  return `<article class="transfer" data-transfer="${room.room}"><div class="transfer-top"><span class="avatar">✦</span><div><b>${escapeHtml(room.sender)} 正在分享</b><small>${room.files.length} 个文件 · 同网优先局域网直连</small></div><button class="primary accept" data-room="${room.room}">接收</button></div><div class="select-row"><label><input class="select-all" type="checkbox" checked> 全部接收</label><span>可勾选需要的文件</span></div><div class="transfer-files">${room.files.map((file, index) => `<label class="receive-file"><input class="receive-check" type="checkbox" data-index="${index}" checked><div class="download">${rowPreview(file)}<strong>${escapeHtml(file.name)}</strong><span>${size(file.size)}</span></div></label>`).join("")}</div><div class="transfer-actions"><button class="decline" data-decline="${room.room}">不接收</button></div></article>`;
 }
 
 function receivingCard(progress) {
@@ -388,25 +426,31 @@ function renderIncoming() {
   const activeRooms = new Set(state.incomingProgress.keys());
   const receiving = [...state.incomingProgress.values()].map(receivingCard).join("");
   const waiting = state.rooms.filter(room => room.room !== state.hosted && room.room !== ownPendingRoom && !activeRooms.has(room.room) && !state.dismissedRooms.has(room.room)).map(waitingCard).join("");
-  const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.saved ? `已直接保存至“${escapeHtml(file.folder)}”` : "已下载到浏览器默认位置"}</small></div></div>${file.saved ? `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>` : `${preview(file, file)}<div class="transfer-files"><a class="download" draggable="true" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} ↓</span></a></div>`}</article>`).join("");
+  const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.resource ? (file.dragUrl ? "已准备跨窗口直接投放" : file.saved ? `已保存至“${escapeHtml(file.folder)}” · 也可直接拖出` : "已保留在当前页面 · 可直接拖到其他应用") : `已直接保存至“${escapeHtml(file.folder)}”`}</small></div></div>${file.resource ? `${preview(file, file, file.id, file.dragUrl)}<div class="transfer-files"><a class="download received-resource" draggable="true" data-received-id="${file.id}" data-drag-url="${file.dragUrl || file.url}" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}" title="拖到桌面、聊天窗口或其他应用；点击则另存"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} · 拖出使用 / 点击保存</span></a></div>` : `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>`}</article>`).join("");
   $("#incomingList").innerHTML = waiting || receiving || completed ? receiving + waiting + completed : '<div class="empty">暂时没有等待接收的内容</div>';
   document.querySelectorAll(".select-all").forEach(toggle => toggle.onchange = () => toggle.closest(".transfer").querySelectorAll(".receive-check").forEach(box => { box.checked = toggle.checked; }));
   document.querySelectorAll(".receive-check").forEach(box => box.onchange = () => { const card = box.closest(".transfer"); const all = [...card.querySelectorAll(".receive-check")]; card.querySelector(".select-all").checked = all.every(item => item.checked); });
   document.querySelectorAll(".accept").forEach(button => button.onclick = () => acceptFiles(button));
   document.querySelectorAll("[data-decline]").forEach(button => button.onclick = () => { state.dismissedRooms.add(button.dataset.decline); receiveFolders.delete(button.dataset.decline); renderIncoming(); toast("已清理此传输，未选择的文件不会下载"); });
-  document.querySelectorAll(".download").forEach(link => link.addEventListener("dragstart", event => event.dataTransfer.setData("DownloadURL", `${link.dataset.mime}:${link.download}:${link.href}`)));
+  document.querySelectorAll("[data-received-id]").forEach(link => link.addEventListener("dragstart", event => {
+    const received = state.received.find(file => file.id === link.dataset.receivedId);
+    addReceivedDragData(event, link, received);
+  }));
 }
 
 async function acceptFiles(button) {
   const card = button.closest(".transfer");
   const selectedIndexes = [...card.querySelectorAll(".receive-check:checked")].map(box => Number(box.dataset.index));
   if (!selectedIndexes.length) { toast("请先选择至少一个文件"); return; }
+  const source = state.rooms.find(room => room.room === button.dataset.room);
+  const files = selectedIndexes.map(index => source?.files?.[index]).filter(Boolean);
+  const requiresStreamingFolder = files.some(file => file.size > BROWSER_FALLBACK_MAX_BYTES);
   let folder = null;
   // Some Android WebViews expose showDirectoryPicker but cannot complete it.
   // Prefer the native MediaStore bridge before probing browser-only directory APIs.
   if (androidAutoSaveAvailable()) {
     toast("安卓会按文件类型自动保存到星桥目录");
-  } else if (window.showDirectoryPicker) {
+  } else if (requiresStreamingFolder && window.showDirectoryPicker) {
     try {
       // Start at Desktop instead of the browser's last-used location. Browsers
       // intentionally deny sensitive system folders, while Desktop is a normal
@@ -419,13 +463,10 @@ async function acceptFiles(button) {
       toast(denied ? "系统目录不能保存；请在打开的窗口中选择“桌面”或普通文件夹并允许写入" : "未选择保存位置，尚未开始接收");
       return;
     }
-  } else toast("此浏览器不支持选择目录，将保存到浏览器默认下载位置");
-  const source = state.rooms.find(room => room.room === button.dataset.room);
-  const files = selectedIndexes.map(index => source?.files?.[index]).filter(Boolean);
-  if (!folder && !androidAutoSaveAvailable() && files.some(file => file.size > BROWSER_FALLBACK_MAX_BYTES)) {
+  } else if (requiresStreamingFolder) {
     toast("此浏览器不能安全保存超过 128 MB 的文件；请用 Chrome 或 Edge 并选择保存文件夹");
     return;
-  }
+  } else toast("文件将保留在当前页面；完成后可直接拖出，或点击保存");
   receiveFolders.set(button.dataset.room, folder);
   state.incomingProgress.set(button.dataset.room, newTransferProgress(button.dataset.room, files, "receive", source?.sender || "对方设备"));
   renderIncoming();
@@ -481,11 +522,18 @@ function publishPendingHost() {
 }
 
 function buildPeer(remote, room, selectedIndexes = null) {
-  const connection = new RTCPeerConnection({ iceServers });
+  const existing = peers.get(remote);
+  if (existing) {
+    try { existing.close(); } catch (_) {}
+  }
+  // ICE assigns host candidates a higher priority than server-reflexive and
+  // TURN relay candidates. Same-LAN devices therefore select the local path;
+  // the public relay is only selected when the direct candidates cannot work.
+  const connection = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 4 });
   peers.set(remote, connection);
   connection.onicecandidate = event => { if (event.candidate) send({ type: "signal", target: remote, room, payload: { kind: "candidate", candidate: event.candidate } }); };
   connection.ondatachannel = event => setupChannel(event.channel, remote, room, selectedIndexes);
-  connection.onconnectionstatechange = () => { if (["failed", "closed", "disconnected"].includes(connection.connectionState)) peers.delete(remote); };
+  connection.onconnectionstatechange = () => { if (["failed", "closed"].includes(connection.connectionState) && peers.get(remote) === connection) peers.delete(remote); };
   return connection;
 }
 
@@ -575,6 +623,9 @@ async function showConnectionPath(remote, attempt = 0) {
 
 function isPrivateLanCandidate(candidate) {
   const address = String(candidate?.address || candidate?.ip || "").toLowerCase();
+  // Chromium may redact a directly-bound host candidate's address in getStats.
+  if (!address && candidate?.candidateType === "host") return true;
+  if (address.endsWith(".local")) return true;
   if (/^(10\.|192\.168\.|169\.254\.)/.test(address)) return true;
   const parts = address.match(/^(172)\.(\d+)\./);
   if (parts && Number(parts[2]) >= 16 && Number(parts[2]) <= 31) return true;
@@ -587,6 +638,7 @@ async function createOffer(remote, room, selectedIndexes, receiverKind = "browse
   setupChannel(channel, remote, room, selectedIndexes, receiverKind);
   await connection.setLocalDescription(await connection.createOffer());
   send({ type: "signal", target: remote, room, payload: { kind: "offer", sdp: connection.localDescription } });
+  $("#privacy").textContent = "正在优先建立局域网直连…";
 }
 
 async function handleSignal(remote, room, payload) {
@@ -594,6 +646,7 @@ async function handleSignal(remote, room, payload) {
   let connection = peers.get(remote);
   if (payload.kind === "offer") {
     connection = buildPeer(remote, room);
+    $("#privacy").textContent = "正在优先建立局域网直连…";
     await connection.setRemoteDescription(payload.sdp);
     for (const candidate of pendingCandidates.get(remote) || []) await connection.addIceCandidate(candidate);
     pendingCandidates.delete(remote);
@@ -709,11 +762,12 @@ async function sendFilesImpl(channel) {
     channel.send(JSON.stringify({ type: "file-start", name: file.name, size: file.size, mime: file.type || "application/octet-stream" }));
     const chunkSize = dataChannelChunkBytes(channel);
     let readOffset = 0;
+    const readBlockBytes = window.AndroidBridge ? ANDROID_FILE_READ_BLOCK_BYTES : BROWSER_FILE_READ_BLOCK_BYTES;
     const readNextBlock = () => {
       if (readOffset >= file.size) return null;
       const start = readOffset;
-      readOffset += FILE_READ_BLOCK_BYTES;
-      return file.slice(start, start + FILE_READ_BLOCK_BYTES).arrayBuffer();
+      readOffset += readBlockBytes;
+      return file.slice(start, start + readBlockBytes).arrayBuffer();
     };
     // Keep exactly one block ahead of the network. This hides MediaStore / WebView
     // read latency without allowing a large video to accumulate in memory.
@@ -802,10 +856,6 @@ async function nextAvailableName(folder, name) {
     try { await folder.getFileHandle(candidate); } catch (_) { return candidate; }
   }
   return `${base}-${Date.now()}${ext}`;
-}
-
-function downloadFallback(blob, name) {
-  const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
 function androidAutoSaveAvailable() { return Boolean(window.AndroidBridge?.beginReceiveFile && window.AndroidBridge?.writeReceiveChunk && window.AndroidBridge?.finishReceiveFile); }
@@ -910,6 +960,83 @@ async function flushAndroidBinaryBuffer(channel) {
   return true;
 }
 
+async function flushBrowserWritableBuffer(channel) {
+  const file = channel.currentFile;
+  if (!file?.writer || !file.writerPendingBytes) return true;
+  const byteLength = file.writerPendingBytes;
+  const payload = mergeArrayBuffers(file.writerPendingBuffers, byteLength);
+  file.writerPendingBuffers = [];
+  file.writerPendingBytes = 0;
+  try {
+    await file.writer.write(payload);
+  } catch (_) {
+    stopIncomingChannel(channel, "无法写入所选文件夹，已停止传输");
+    return false;
+  }
+  acknowledgeReceivedChunk(channel, byteLength);
+  advanceIncomingProgress(channel.room, byteLength);
+  return true;
+}
+
+function directDragFilename(name) {
+  return String(name || "xingqiao-file").replace(/[\\/\r\n:]/g, "_");
+}
+
+function prepareDirectDragWorker() {
+  if (!window.isSecureContext || !navigator.serviceWorker || !window.caches) return Promise.reject(new Error("当前页面不支持临时拖拽文件"));
+  if (!directDragWorker) directDragWorker = navigator.serviceWorker.register("/drag-worker.js", { scope: "/" });
+  return directDragWorker.then(() => navigator.serviceWorker.ready);
+}
+
+async function discardDirectDragUrl(url) {
+  if (!url || !directDragUrls.delete(url)) return;
+  try { (await caches.open(DIRECT_DRAG_CACHE)).delete(url); } catch (_) {}
+}
+
+/**
+ * Chromium's DownloadURL protocol expects an HTTP(S) URL, not a page-owned
+ * blob URL. Store a short-lived copy behind a service-worker route so dropping
+ * onto Finder/Explorer or a native app creates the promised file at the target
+ * instead of handing it an unusable browser URL.
+ */
+async function prepareDirectDragUrl(resource, name, mime) {
+  if (!resource) return "";
+  try {
+    await prepareDirectDragWorker();
+    const url = new URL(`${DIRECT_DRAG_PATH}${crypto.randomUUID()}`, location.origin).href;
+    const response = new Response(resource, { headers: {
+      "Content-Type": mime || resource.type || "application/octet-stream",
+      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(directDragFilename(name))}`,
+      "Cache-Control": "no-store",
+    }});
+    await (await caches.open(DIRECT_DRAG_CACHE)).put(url, response);
+    directDragUrls.add(url);
+    setTimeout(() => { discardDirectDragUrl(url); }, DIRECT_DRAG_LIFETIME_MS);
+    return url;
+  } catch (_) {
+    // In non-secure contexts or browsers without service workers the normal
+    // File drag data remains available to compatible web upload targets.
+    return "";
+  }
+}
+
+async function rememberReceivedFile(file, resource, saved, folder = "") {
+  const url = resource ? URL.createObjectURL(resource) : "";
+  const dragUrl = resource ? await prepareDirectDragUrl(resource, file.savedName || file.name, file.mime) : "";
+  state.received.push({
+    id: crypto.randomUUID(),
+    name: file.savedName || file.name,
+    size: file.size,
+    mime: file.mime,
+    type: file.mime,
+    saved,
+    folder,
+    resource,
+    url,
+    dragUrl,
+  });
+}
+
 async function receive(channel, data) {
   if (typeof data === "string") {
     let message; try { message = JSON.parse(data); } catch (_) { return; }
@@ -933,7 +1060,10 @@ async function receive(channel, data) {
           const name = await nextAvailableName(channel.folder, message.name);
           const handle = await channel.folder.getFileHandle(name, { create: true });
           channel.currentFile.writer = await handle.createWritable();
+          channel.currentFile.handle = handle;
           channel.currentFile.savedName = name;
+          channel.currentFile.writerPendingBuffers = [];
+          channel.currentFile.writerPendingBytes = 0;
         } catch (_) {
           stopIncomingChannel(channel, "无法写入所选文件夹，已停止传输");
           return;
@@ -953,24 +1083,24 @@ async function receive(channel, data) {
     if (message.type === "file-end" && channel.currentFile) {
       const file = channel.currentFile;
       if (file.writer) {
+        if (!await flushBrowserWritableBuffer(channel)) return;
         await file.writer.close();
-        state.received.push({ ...file, saved: true, folder: channel.folder.name, type: file.mime });
+        const resource = await file.handle.getFile();
+        await rememberReceivedFile(file, resource, true, channel.folder.name);
         toast(`已保存 ${file.savedName} 到 ${channel.folder.name}`);
       } else if (file.android) {
         if (!file.androidFailed) {
           if (!await flushAndroidBinaryBuffer(channel)) return;
           const result = finishAndroidSave(file.android.token);
           if (result?.ok) {
-            state.received.push({ ...file, saved: true, folder: result.folder, type: file.mime });
+            await rememberReceivedFile(file, null, true, result.folder);
             toast(`已自动保存 ${file.name} 到 ${result.folder}`);
           } else toast(`${file.name} 保存失败，请重新接收`);
         }
       } else {
-        const blob = new Blob(file.chunks, { type: file.mime });
-        const url = URL.createObjectURL(blob);
-        downloadFallback(blob, file.name);
-        state.received.push({ ...file, url, saved: false, type: file.mime });
-        toast(`已下载 ${file.name}`);
+        const resource = new File(file.chunks, file.name, { type: file.mime, lastModified: Date.now() });
+        await rememberReceivedFile(file, resource, false);
+        toast(`已接收 ${file.name}，可直接拖到其他应用`);
       }
       channel.currentFile = null;
       const progress = state.incomingProgress.get(channel.room);
@@ -989,7 +1119,14 @@ async function receive(channel, data) {
     return;
   }
   const bytes = data.byteLength || 0;
-  if (channel.currentFile?.writer) await channel.currentFile.writer.write(data);
+  if (channel.currentFile?.writer) {
+    const file = channel.currentFile;
+    file.writerPendingBuffers.push(data);
+    file.writerPendingBytes += bytes;
+    if (file.writerPendingBytes < BROWSER_WRITABLE_BATCH_BYTES) return;
+    await flushBrowserWritableBuffer(channel);
+    return;
+  }
   else if (channel.currentFile?.android && !channel.currentFile.androidFailed) {
     const file = channel.currentFile;
     if (file.android.binary) {
@@ -1159,6 +1296,8 @@ window.addEventListener("pagehide", () => {
   const room = state.hosted || state.pendingHost?.room;
   if (room) send({ type: "leave", room });
   nativeTransferKeys.clear();
+  state.received.forEach(file => { if (file.url) URL.revokeObjectURL(file.url); });
+  [...directDragUrls].forEach(url => { discardDirectDragUrl(url); });
   try { window.AndroidBridge?.setTransferActive?.(false); } catch (_) {}
   peers.forEach(peer => peer.close());
 });

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import mimetypes
 import os
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import BinaryIO
 from urllib.parse import quote, unquote, urlparse, parse_qs
 from email.message import Message
@@ -35,6 +37,15 @@ class TransferFile:
     path: Path
     size: int
     mime: str
+    complete: bool = True
+    bytes_written: int = 0
+    failed: bool = False
+    upload_started: bool = False
+    condition: threading.Condition = field(default_factory=threading.Condition, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.complete:
+            self.bytes_written = self.size
 
 
 @dataclass
@@ -79,8 +90,19 @@ class TransferStore:
                 safe_name = Path(item.filename).name or "unnamed-file"
                 file_id = uuid.uuid4().hex
                 path = target / file_id
-                with item.path.open("rb") as source:
-                    size = self._save_limited(source, path)
+                size = item.path.stat().st_size
+                if size > MAX_FILE_BYTES:
+                    raise ValueError("单个文件不能超过 4 GiB")
+                # Multipart uploads are already staged below STORE_ROOT. Rename
+                # them into the session instead of reading and writing every byte
+                # for a second time. Keep a cross-device fallback for callers that
+                # construct UploadPart objects themselves.
+                try:
+                    os.replace(item.path, path)
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+                    shutil.move(str(item.path), path)
                 files.append(TransferFile(file_id, safe_name, path, size, item.mime or "application/octet-stream"))
             if not files:
                 raise ValueError("请选择至少一个文件")
@@ -92,6 +114,58 @@ class TransferStore:
         except Exception:
             shutil.rmtree(target, ignore_errors=True)
             raise
+
+    def create_pending(self, sender: str, mode: str, metadata: list[dict]) -> Session:
+        """Publish upload slots before their bodies arrive so downloads can stream.
+
+        The browser uploads each raw File straight into its final session path.
+        Receivers may start reading that growing file immediately, removing both
+        the old staging copy and the upload-then-download serialization.
+        """
+        if not isinstance(metadata, list) or not metadata or len(metadata) > 100:
+            raise ValueError("请选择 1 至 100 个文件")
+        session_id = uuid.uuid4().hex
+        target = self.root / session_id
+        target.mkdir(mode=0o700)
+        files: list[TransferFile] = []
+        try:
+            for raw in metadata:
+                if not isinstance(raw, dict):
+                    raise ValueError("无效的文件信息")
+                safe_name = Path(str(raw.get("name", ""))).name or "unnamed-file"
+                try:
+                    size = int(raw.get("size", 0))
+                except (TypeError, ValueError):
+                    raise ValueError("无效的文件大小") from None
+                if size <= 0 or size > MAX_FILE_BYTES:
+                    raise ValueError("文件必须大于 0 且不能超过 4 GiB")
+                mime = str(raw.get("mime", "application/octet-stream"))[:200] or "application/octet-stream"
+                if any(ord(character) < 32 or ord(character) == 127 for character in mime):
+                    mime = "application/octet-stream"
+                file_id = uuid.uuid4().hex
+                path = target / file_id
+                path.touch(mode=0o600)
+                files.append(TransferFile(file_id, safe_name, path, size, mime, complete=False))
+            session = Session(session_id, sender.strip()[:48] or "匿名设备",
+                              mode if mode in {"photos", "files", "social"} else "files", files)
+            with self.lock:
+                self.sessions[session_id] = session
+            return session
+        except Exception:
+            shutil.rmtree(target, ignore_errors=True)
+            raise
+
+    def begin_upload(self, session_id: str, file_id: str, size: int) -> tuple[Session, TransferFile] | None:
+        session = self.get(session_id)
+        file = next((item for item in session.files if item.id == file_id), None) if session else None
+        if not session or not file or file.size != size:
+            return None
+        with file.condition:
+            if file.upload_started or file.complete or file.failed:
+                return None
+            file.upload_started = True
+        self.touch(session_id)
+        return session, file
 
     @staticmethod
     def _save_limited(source: BinaryIO, destination: Path) -> int:
@@ -136,6 +210,10 @@ class TransferStore:
             session = self.sessions.pop(session_id, None)
         if not session:
             return False
+        for file in session.files:
+            with file.condition:
+                file.failed = True
+                file.condition.notify_all()
         shutil.rmtree(self.root / session_id, ignore_errors=True)
         return True
 
@@ -235,12 +313,28 @@ def session_data(session: Session) -> dict:
         "id": session.id, "sender": session.sender, "mode": session.mode,
         "createdAt": session.created_at,
         "expiresIn": max(0, int(HEARTBEAT_SECONDS - (time.time() - session.last_seen))),
-        "files": [{"id": f.id, "name": f.name, "size": f.size, "mime": f.mime} for f in session.files],
+        "files": [{"id": f.id, "name": f.name, "size": f.size, "mime": f.mime,
+                   "ready": f.complete, "received": f.bytes_written} for f in session.files],
     }
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Xingqiao/1.0"
+    protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        # Larger kernel socket buffers prevent the Python coordinator from
+        # becoming the limiting window on fast Wi-Fi / 2.5 GbE networks.
+        for option, value in ((socket.SO_SNDBUF, 4 * 1024 * 1024), (socket.SO_RCVBUF, 4 * 1024 * 1024)):
+            try:
+                self.connection.setsockopt(socket.SOL_SOCKET, option, value)
+            except OSError:
+                pass
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
@@ -248,8 +342,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Xingqiao-Device")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -272,8 +366,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{self.quote_filename(file.name)}")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            with file.path.open("rb") as source:
-                shutil.copyfileobj(source, self.wfile, 1024 * 1024)
+            try:
+                self.stream_file(file)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self.close_connection = True
             return
         self.static(path)
 
@@ -289,6 +385,19 @@ class Handler(BaseHTTPRequestHandler):
             self.json(HTTPStatus.OK, {"stopping": True})
             # Shutdown must run outside this request thread, otherwise HTTPServer deadlocks.
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        if path == "/api/sessions/init":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 1024 * 1024:
+                    raise ValueError("无效的传输信息")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("无效的传输信息")
+                session = STORE.create_pending(str(payload.get("sender", "")), str(payload.get("mode", "files")), payload.get("files"))
+                self.json(HTTPStatus.CREATED, session_data(session))
+            except (ValueError, TypeError, json.JSONDecodeError, OSError) as error:
+                self.json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         if path == "/api/sessions":
             try:
@@ -319,6 +428,47 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.json(HTTPStatus.NOT_FOUND, {"error": "未知接口"})
 
+    def do_PUT(self) -> None:
+        parts = urlparse(self.path).path.strip("/").split("/")
+        if len(parts) != 5 or parts[:2] != ["api", "sessions"] or parts[3] != "files":
+            self.close_connection = True
+            self.json(HTTPStatus.NOT_FOUND, {"error": "未知接口"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except ValueError:
+            length = -1
+        target = STORE.begin_upload(parts[2], parts[4], length)
+        if target is None:
+            self.close_connection = True
+            self.json(HTTPStatus.CONFLICT, {"error": "上传已失效、大小不符或文件正在上传"})
+            return
+        session, file = target
+        try:
+            remaining = length
+            with file.path.open("wb", buffering=0) as out:
+                while remaining:
+                    read_size = min(4 * 1024 * 1024, remaining)
+                    read1 = getattr(self.rfile, "read1", None)
+                    chunk = read1(read_size) if read1 else self.rfile.read(read_size)
+                    if not chunk:
+                        raise ValueError("上传意外中断")
+                    out.write(chunk)
+                    remaining -= len(chunk)
+                    session.last_seen = time.time()
+                    with file.condition:
+                        file.bytes_written += len(chunk)
+                        file.condition.notify_all()
+            with file.condition:
+                file.complete = True
+                file.condition.notify_all()
+            self.json(HTTPStatus.OK, {"uploaded": True})
+        except (ValueError, OSError) as error:
+            with file.condition:
+                file.failed = True
+                file.condition.notify_all()
+            self.json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+
     def do_DELETE(self) -> None:
         parts = urlparse(self.path).path.strip("/").split("/")
         if len(parts) == 3 and parts[:2] == ["api", "sessions"]:
@@ -343,6 +493,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def stream_file(self, file: TransferFile) -> None:
+        with file.path.open("rb") as source:
+            if file.complete:
+                # socket.sendfile uses the platform's zero-copy path where
+                # available and transparently falls back on unsupported hosts.
+                self.wfile.flush()
+                self.connection.sendfile(source)
+                return
+            sent = 0
+            while sent < file.size:
+                chunk = source.read(min(4 * 1024 * 1024, file.size - sent))
+                if chunk:
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+                    continue
+                with file.condition:
+                    if file.failed:
+                        raise ConnectionAbortedError("上传端已中断")
+                    if file.complete and file.bytes_written <= sent:
+                        break
+                    file.condition.wait(timeout=0.5)
+            if sent != file.size:
+                raise ConnectionAbortedError("文件未完整上传")
+
     def json(self, status: HTTPStatus, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(status)
@@ -359,8 +533,23 @@ class Handler(BaseHTTPRequestHandler):
         return quote(name, safe="")
 
 
+class TransferHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+    allow_reuse_address = True
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind() does a reverse-DNS lookup through getfqdn().
+        # That lookup can pause startup for tens of seconds on an offline LAN,
+        # even though this server only needs to bind a local address. Avoiding it
+        # also makes the launcher and test server available immediately.
+        TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+
+
 def serve(host: str = "0.0.0.0", port: int = 8787, host_token: str = "") -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd = TransferHTTPServer((host, port), Handler)
     httpd.host_token = host_token  # only the locally launched coordinator page receives this token
     return httpd
 

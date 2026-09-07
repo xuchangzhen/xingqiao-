@@ -1,5 +1,7 @@
 import io
+import http.client
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -64,6 +66,53 @@ class TransferServerTest(unittest.TestCase):
             html = response.read().decode()
         self.assertIn("星桥", html)
         self.assertIn("app.js", html)
+
+    def test_raw_upload_can_be_downloaded_while_it_is_still_arriving(self):
+        content = b"first-half--second-half"
+        init = json.dumps({
+            "sender": "fast-browser",
+            "mode": "files",
+            "files": [{"name": "stream.bin", "size": len(content), "mime": "application/octet-stream"}],
+        }).encode()
+        with self.request("/api/sessions/init", init, "POST", {"Content-Type": "application/json"}) as response:
+            created = json.load(response)
+        self.assertFalse(created["files"][0]["ready"])
+
+        session_id = created["id"]
+        file_id = created["files"][0]["id"]
+        upload = http.client.HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=5)
+        upload.putrequest("PUT", f"/api/sessions/{session_id}/files/{file_id}")
+        upload.putheader("Content-Length", str(len(content)))
+        upload.putheader("Content-Type", "application/octet-stream")
+        upload.endheaders()
+        upload.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        split = len(content) // 2
+        upload.send(content[:split])
+
+        pending = server.STORE.sessions[session_id].files[0]
+        with pending.condition:
+            arrived = pending.condition.wait_for(lambda: pending.bytes_written == split, timeout=2)
+        self.assertTrue(arrived, "server should expose bytes before the PUT request finishes")
+
+        downloaded: dict[str, bytes] = {}
+        download_done = threading.Event()
+
+        def download() -> None:
+            with self.request(f"/api/sessions/{session_id}/files/{file_id}") as response:
+                downloaded["body"] = response.read()
+            download_done.set()
+
+        receiver = threading.Thread(target=download, daemon=True)
+        receiver.start()
+        self.assertFalse(download_done.wait(0.1), "download should wait for the rest of the growing file")
+        upload.send(content[split:])
+        with upload.getresponse() as response:
+            self.assertEqual(response.status, 200)
+            self.assertTrue(json.load(response)["uploaded"])
+        upload.close()
+        receiver.join(2)
+        self.assertEqual(downloaded["body"], content)
+        self.assertTrue(pending.complete)
 
     def test_only_coordinator_can_stop_server(self):
         with self.assertRaises(HTTPError) as forbidden:

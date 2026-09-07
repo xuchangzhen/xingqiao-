@@ -61,8 +61,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -82,7 +84,16 @@ public class MainActivity extends Activity {
     private TextView welcomeStatus;
     private Button welcomePrimary;
     private ValueCallback<Uri[]> chooserCallback;
-    private final ArrayList<Uri> pendingSocial = new ArrayList<>();
+    /**
+     * Android share sheets commonly expose the same item in EXTRA_STREAM and
+     * ClipData (and some vendors populate both the single and multiple forms).
+     * Keep the user-visible order, but admit each content URI only once.
+     *
+     * JavaScript-interface calls run off the UI thread, therefore the list also
+     * needs to be safe while the activity receives another share intent.
+     */
+    private final List<Uri> pendingSocial = new CopyOnWriteArrayList<>();
+    private final Set<String> pendingSocialKeys = ConcurrentHashMap.newKeySet();
     private final Map<String, PendingReceive> pendingReceives = new ConcurrentHashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private volatile String binaryReceiveToken;
@@ -341,12 +352,24 @@ public class MainActivity extends Activity {
 
     private void readShareIntent(Intent intent) {
         if (!Intent.ACTION_SEND.equals(intent.getAction()) && !Intent.ACTION_SEND_MULTIPLE.equals(intent.getAction())) return;
-        Uri one = intent.getParcelableExtra(Intent.EXTRA_STREAM);
-        if (one != null) pendingSocial.add(one);
+        if (Intent.ACTION_SEND.equals(intent.getAction())) addPendingSocial(intent.getParcelableExtra(Intent.EXTRA_STREAM));
         ArrayList<Uri> multiple = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
-        if (multiple != null) pendingSocial.addAll(multiple);
+        if (multiple != null) for (Uri uri : multiple) addPendingSocial(uri);
         ClipData clips = intent.getClipData();
-        if (clips != null) for (int i = 0; i < clips.getItemCount(); i++) if (clips.getItemAt(i).getUri() != null) pendingSocial.add(clips.getItemAt(i).getUri());
+        if (clips != null) for (int i = 0; i < clips.getItemCount(); i++) addPendingSocial(clips.getItemAt(i).getUri());
+    }
+
+    private void addPendingSocial(Uri uri) {
+        if (uri == null) return;
+        // `normalizeScheme` handles the only URI normalization Android itself
+        // guarantees, while preserving provider-specific paths and query data.
+        String key = uri.normalizeScheme().toString();
+        if (pendingSocialKeys.add(key)) pendingSocial.add(uri);
+    }
+
+    private void clearPendingSocial() {
+        pendingSocial.clear();
+        pendingSocialKeys.clear();
     }
 
     @Override protected void onActivityResult(int code, int result, Intent data) {
@@ -609,7 +632,7 @@ public class MainActivity extends Activity {
                 return Base64.encodeToString(count == buffer.length ? buffer : java.util.Arrays.copyOf(buffer, count), Base64.NO_WRAP);
             } catch (Exception error) { return ""; }
         }
-        @android.webkit.JavascriptInterface public void clearPendingSocial() { if (isTrustedBridgeCall()) pendingSocial.clear(); }
+        @android.webkit.JavascriptInterface public void clearPendingSocial() { if (isTrustedBridgeCall()) MainActivity.this.clearPendingSocial(); }
         /** Opens the requested social app; Android intentionally does not expose its chat data. */
         @android.webkit.JavascriptInterface public void openSocialApp(String packageName) {
             if (!isTrustedBridgeCall()) return;
@@ -684,7 +707,11 @@ public class MainActivity extends Activity {
         /** Local-network server compatibility: the desktop coordinator accepts this multipart upload. */
         @android.webkit.JavascriptInterface public void uploadPendingSocial(String origin, String sender, String source) {
             final ArrayList<Uri> items = new ArrayList<>(pendingSocial);
-            pendingSocial.clear();
+            if (items.isEmpty()) return;
+            // Mark this immutable batch as consumed before scheduling I/O, so a
+            // fast double tap cannot create two identical upload sessions. A
+            // share received while this upload runs is added as a fresh batch.
+            MainActivity.this.clearPendingSocial();
             io.execute(() -> {
                 try {
                     JSONObject session = upload(origin + "/api/sessions", items, sender + " · " + source);

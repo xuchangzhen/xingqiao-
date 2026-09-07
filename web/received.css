@@ -1,0 +1,14 @@
+.download:active { cursor: grabbing; }
+.download strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.download span { text-align: right; }
+.received-resource { background: #eaf3ff; box-shadow: inset 0 0 0 1px #a8c8fa; }
+.received-preview { position: relative; display: block; width: min(100%, 540px); margin: 12px 0 0 43px; overflow: hidden; border: 1px solid #b9d4fb; border-radius: 15px; background: #eef4fd; box-shadow: 0 10px 24px #4d7ec31c; cursor: grab; text-decoration: none; }
+.received-preview:hover { border-color: #6da4f5; box-shadow: 0 13px 28px #4d7ec333; }
+.received-preview:active { cursor: grabbing; }
+.received-preview img { display: block; width: 100%; max-height: 340px; object-fit: contain; background: #eef2f7; }
+.received-preview span { display: block; padding: 8px 11px; border-top: 1px solid #d8e6fa; color: #3866a8; font-size: 12px; font-weight: 650; text-align: center; }
+
+@media (max-width: 620px) {
+  .received-preview { width: 100%; margin-left: 0; }
+  .received-preview img { max-height: 280px; }
+}

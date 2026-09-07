@@ -24,8 +24,13 @@
 .progress-track i { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #287bf4, #7d71ef); transition: width .18s ease; }
 .text-preview { max-height: 82px; overflow: hidden; border-radius: 9px; background: #f1f5fa; padding: 10px 11px; color: #4e5d72; font-size: 12px; line-height: 1.45; white-space: pre-wrap; }
 .transfer-preview { margin-top: 11px; padding-left: 43px; }
-.transfer-preview .file-preview { width: 100%; height: 150px; }
+.transfer-preview .file-preview { width: 100%; height: 190px; }
 .transfer-preview video.file-preview { background: #172033; }
+.received-preview-link { position: relative; display: block; overflow: hidden; border: 1px solid #b9d4fb; border-radius: 15px; background: #eef4fd; box-shadow: 0 10px 24px #4d7ec31c; color: inherit; cursor: grab; text-decoration: none; }
+.received-preview-link:hover { border-color: #6da4f5; box-shadow: 0 13px 28px #4d7ec333; }
+.received-preview-link:active { cursor: grabbing; }
+.received-preview-link .file-preview { display: block; height: min(300px, 38vw); max-height: 300px; background: #eef2f7; object-fit: contain; }
+.received-preview-link span { display: block; padding: 8px 11px; border-top: 1px solid #d8e6fa; color: #3866a8; font-size: 12px; font-weight: 650; text-align: center; }
 .transfer-top .accept { margin-left: auto; padding: 8px 14px; font-size: 12px; }
 .select-row { display: flex; justify-content: space-between; align-items: center; margin: 13px 0 -2px 43px; color: var(--muted); font-size: 11px; }
 .select-row label, .receive-file { cursor: pointer; }
@@ -36,6 +41,10 @@
 .receive-file input:checked + .download::before { content: "✓"; margin-left: -23px; width: 15px; color: #287bf4; font-weight: 800; }
 .receive-file .file-preview { width: 34px; height: 34px; border-radius: 8px; }
 .receive-file .file-badge { width: 34px; height: 34px; border-radius: 8px; font-size: 10px; }
+.download:active { cursor: grabbing; }
+.download strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.download span { text-align: right; }
+.received-resource { background: #eaf3ff; box-shadow: inset 0 0 0 1px #a8c8fa; }
 
 @media (max-width: 760px) { .mode-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 620px) { .clipboard-panel, .social-panel { grid-template-columns: 1fr; } .clipboard-panel .secondary { justify-self: start; } .social-actions { justify-content: flex-start; } .send-row { gap: 12px; } .send-actions { flex: none; } .header-actions { gap: 6px; } .update-button { padding: 7px 9px; } .transfer-progress.compact { margin-left: 0; } .progress-copy { align-items: flex-start; flex-direction: column; gap: 3px; } }
+@media (max-width: 620px) { .clipboard-panel, .social-panel { grid-template-columns: 1fr; } .clipboard-panel .secondary { justify-self: start; } .social-actions { justify-content: flex-start; } .send-row { gap: 12px; } .send-actions { flex: none; } .header-actions { gap: 6px; } .update-button { padding: 7px 9px; } .transfer-progress.compact { margin-left: 0; } .transfer-preview { padding-left: 0; } .received-preview-link .file-preview { height: 250px; } .progress-copy { align-items: flex-start; flex-direction: column; gap: 3px; } }
