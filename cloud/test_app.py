@@ -61,8 +61,10 @@ class SignalHubTest(unittest.TestCase):
             return owner.json_messages[-1]
 
         android = asyncio.run(scenario("android"))
+        desktop = asyncio.run(scenario("desktop"))
         browser = asyncio.run(scenario("anything-else"))
         self.assertEqual(android["receiver"], "android")
+        self.assertEqual(desktop["receiver"], "desktop")
         self.assertEqual(browser["receiver"], "browser")
 
 

@@ -84,7 +84,10 @@ class SignalHub:
             selected = sorted({index for index in selected if isinstance(index, int) and 0 <= index < len(data["meta"]["files"])})
             if not selected:
                 return
-            receiver = "android" if payload.get("receiver") == "android" else "browser"
+            # Android needs a deliberately small acknowledgement window. The
+            # macOS companion also writes natively, but it can safely use the
+            # desktop window instead of inheriting Android's throughput cap.
+            receiver = payload.get("receiver") if payload.get("receiver") in {"android", "desktop"} else "browser"
             await self.peers[peer_id].send_json({"type": "joined", "room": room, "owner": data["owner"]})
             await self.peers[data["owner"]].send_json({"type": "peer-joined", "room": room, "peer": peer_id, "selected": selected, "receiver": receiver})
             return

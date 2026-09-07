@@ -13,6 +13,8 @@
 - Android 14 WebView 壳，支持系统文件选择器和作为分享目标接收内容。
 - Android 14 接收内容会自动分类保存：图片到“图片/星桥”、视频到“视频/星桥”、音频到“音乐/星桥”、其他文件到“下载/星桥”。
 - Android App 使用系统自适应图标，并将接收内容通过原生 MediaStore 流式写入，避免网页下载策略因设备不同而失效。
+- macOS 桌面端将点“接收”的文件流式写入本机临时收件箱，并以真实本地文件提供原生拖拽；可拖入 ChatGPT、Codex 等聊天窗口，或点击“保存到…”永久保留。
+- macOS 临时收件箱位于系统缓存目录；未保存文件会在退出星桥时清理，异常退出后的残留会在下次启动时清理。
 - App 与云端页面均禁用传输逻辑缓存，避免更新后继续运行与原生桥接不兼容的旧网页脚本。
 - 若 Android 系统回收 WebView 的媒体渲染进程，App 会自动创建新的页面实例并恢复到可继续选择文件的状态。
 - Android App 内可“检查更新”：下载 GitHub Release 中的 APK 后交给系统安装确认；首次安装带此功能的版本仍需手动安装一次。
@@ -87,12 +89,29 @@ cd android
 
 签名密钥、`keystore.properties`、APK 和本机 SDK 路径均不会提交到仓库。
 
+## macOS 桌面端
+
+桌面端是原生悬浮收件箱加网页传输界面，要求 macOS 14 及以上与 Xcode Command Line Tools。首次启动时输入自己的 HTTPS 星桥地址；该地址仅保存到本机用户偏好中，不会提交到仓库。
+
+接收时，文件会先流式写入 `~/Library/Caches/Xingqiao/Inbox`。在“星桥临时收件箱”悬浮窗中拖动条目，会向目标应用交付真正的 `file://` 文件，因此可用于 ChatGPT、Codex 和其他支持 macOS 文件投放的应用。点击“保存到…”才会移到用户选定的永久目录；直接退出星桥会删除尚未保存的临时文件。
+
+构建当前 Mac 可运行的 `.app`：
+
+```bash
+cd desktop/macos
+./build-app.sh
+open dist/星桥.app
+```
+
+桌面端使用非持久网页缓存，并在每次启动或点“刷新网页”时从部署地址重新获取页面。因此先将同一提交的 `cloud/` 部署到服务器后，所有桌面端无需重新安装即可得到对应的网页更新；桌面端原生能力变更时，再重新构建并分发 `.app`。
+
 ## 验证
 
 ```bash
 python3 -m unittest -v tests/test_server.py
 python3 -m unittest -v cloud.test_app
 ./android/gradlew -p "$PWD/android" assembleDebug
+swift build --package-path desktop/macos
 ```
 
 ## 隐私与安全

@@ -12,5 +12,7 @@ __pycache__/
 **/__pycache__/
 .DS_Store
 *.apk
+desktop/macos/.build/
+desktop/macos/dist/
 xingqiao-cloud.tar.gz
 社交媒体选择文件示例/

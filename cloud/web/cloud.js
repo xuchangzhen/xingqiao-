@@ -88,7 +88,7 @@ function send(message) {
 function newRoomCode() { return Array.from(crypto.getRandomValues(new Uint32Array(3)), n => n.toString(36).padStart(4, "0").slice(-4)).join(""); }
 function isImage(file) { return file.type.startsWith("image/"); }
 function isVideo(file) { return file.type.startsWith("video/"); }
-function canPreviewImage(file) { return !window.AndroidBridge && isImage(file) && file.size <= IMAGE_PREVIEW_SIZE_LIMIT; }
+function canPreviewImage(file) { return !window.AndroidBridge && !window.XingqiaoDesktop && isImage(file) && file.size <= IMAGE_PREVIEW_SIZE_LIMIT; }
 
 function addReceivedDragData(event, link, received) {
   const transfer = event.dataTransfer;
@@ -426,7 +426,7 @@ function renderIncoming() {
   const activeRooms = new Set(state.incomingProgress.keys());
   const receiving = [...state.incomingProgress.values()].map(receivingCard).join("");
   const waiting = state.rooms.filter(room => room.room !== state.hosted && room.room !== ownPendingRoom && !activeRooms.has(room.room) && !state.dismissedRooms.has(room.room)).map(waitingCard).join("");
-  const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.resource ? (file.dragUrl ? "已准备跨窗口直接投放" : file.saved ? `已保存至“${escapeHtml(file.folder)}” · 也可直接拖出` : "已保留在当前页面 · 可直接拖到其他应用") : `已直接保存至“${escapeHtml(file.folder)}”`}</small></div></div>${file.resource ? `${preview(file, file, file.id, file.dragUrl)}<div class="transfer-files"><a class="download received-resource" draggable="true" data-received-id="${file.id}" data-drag-url="${file.dragUrl || file.url}" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}" title="拖到桌面、聊天窗口或其他应用；点击则另存"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} · 拖出使用 / 点击保存</span></a></div>` : `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>`}</article>`).join("");
+  const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.resource ? (file.dragUrl ? "已准备跨窗口直接投放" : file.saved ? `已保存至“${escapeHtml(file.folder)}” · 也可直接拖出` : "已保留在当前页面 · 可直接拖到其他应用") : file.nativeInbox ? "已暂存到桌面收件箱，可从悬浮窗直接拖入聊天" : `已直接保存至“${escapeHtml(file.folder)}”`}</small></div></div>${file.resource ? `${preview(file, file, file.id, file.dragUrl)}<div class="transfer-files"><a class="download received-resource" draggable="true" data-received-id="${file.id}" data-drag-url="${file.dragUrl || file.url}" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}" title="拖到桌面、聊天窗口或其他应用；点击则另存"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} · 拖出使用 / 点击保存</span></a></div>` : file.nativeInbox ? `<div class="transfer-files"><button class="secondary native-inbox" data-open-native-inbox><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} · 在悬浮收件箱中拖出</span></button></div>` : `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>`}</article>`).join("");
   $("#incomingList").innerHTML = waiting || receiving || completed ? receiving + waiting + completed : '<div class="empty">暂时没有等待接收的内容</div>';
   document.querySelectorAll(".select-all").forEach(toggle => toggle.onchange = () => toggle.closest(".transfer").querySelectorAll(".receive-check").forEach(box => { box.checked = toggle.checked; }));
   document.querySelectorAll(".receive-check").forEach(box => box.onchange = () => { const card = box.closest(".transfer"); const all = [...card.querySelectorAll(".receive-check")]; card.querySelector(".select-all").checked = all.every(item => item.checked); });
@@ -436,6 +436,9 @@ function renderIncoming() {
     const received = state.received.find(file => file.id === link.dataset.receivedId);
     addReceivedDragData(event, link, received);
   }));
+  document.querySelectorAll("[data-open-native-inbox]").forEach(button => button.onclick = () => {
+    try { window.XingqiaoDesktop?.showInbox?.(); } catch (_) { toast("请在星桥桌面端打开临时收件箱"); }
+  });
 }
 
 async function acceptFiles(button) {
@@ -448,8 +451,8 @@ async function acceptFiles(button) {
   let folder = null;
   // Some Android WebViews expose showDirectoryPicker but cannot complete it.
   // Prefer the native MediaStore bridge before probing browser-only directory APIs.
-  if (androidAutoSaveAvailable()) {
-    toast("安卓会按文件类型自动保存到星桥目录");
+  if (nativeSaveAvailable()) {
+    toast(window.XingqiaoDesktop ? "文件将暂存到星桥收件箱，可从悬浮窗直接拖入聊天" : "安卓会按文件类型自动保存到星桥目录");
   } else if (requiresStreamingFolder && window.showDirectoryPicker) {
     try {
       // Start at Desktop instead of the browser's last-used location. Browsers
@@ -473,7 +476,7 @@ async function acceptFiles(button) {
   // Start while this user action is visible. Android 12+ can reject a newly
   // created foreground service after the Activity has already gone background.
   setAndroidTransferActive(`receive:${button.dataset.room}`, true);
-  send({ type: "join", room: button.dataset.room, selected: selectedIndexes, receiver: androidAutoSaveAvailable() ? "android" : "browser" });
+  send({ type: "join", room: button.dataset.room, selected: selectedIndexes, receiver: localReceiverKind() });
   toast("正在建立设备直连…");
 }
 
@@ -553,7 +556,7 @@ function setupChannel(channel, remote, room, selectedIndexes = null, receiverKin
   // channel accepted from a remote sender, derive the local capability instead
   // so acknowledgement pacing always protects the actual receiving device.
   channel.remoteReceiverKind = receiverKind;
-  channel.localReceiverKind = androidAutoSaveAvailable() ? "android" : "browser";
+  channel.localReceiverKind = localReceiverKind();
   const sendTargetKind = channel.isSender ? channel.remoteReceiverKind : channel.localReceiverKind;
   channel.maxInFlightBytes = sendTargetKind === "android" ? ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES : BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES;
   channel.bufferHighWaterBytes = sendTargetKind === "android" ? ANDROID_RECEIVER_BUFFER_HIGH_BYTES : BROWSER_RECEIVER_BUFFER_HIGH_BYTES;
@@ -585,7 +588,7 @@ function setupChannel(channel, remote, room, selectedIndexes = null, receiverKin
     wakeAckWaiters(channel);
     setAndroidTransferActive(`receive:${channel.room}`, false);
     if (channel.currentFile?.android?.token) {
-      try { window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token); } catch (_) {}
+      abortAndroidSave(channel.currentFile.android.token);
       abortAndroidBinaryWrites("连接已关闭");
     }
     toast("设备连接已关闭");
@@ -734,7 +737,7 @@ function stopIncomingChannel(channel, message) {
   setAndroidTransferActive(`receive:${channel.room}`, false);
   abortAndroidBinaryWrites(message);
   if (channel.currentFile?.android?.token) {
-    try { window.AndroidBridge.abortReceiveFile(channel.currentFile.android.token); } catch (_) {}
+    abortAndroidSave(channel.currentFile.android.token);
   }
   if (channel.readyState === "open") channel.send(JSON.stringify({ type: "abort", reason: message }));
   try { channel.close(); } catch (_) {}
@@ -858,13 +861,32 @@ async function nextAvailableName(folder, name) {
   return `${base}-${Date.now()}${ext}`;
 }
 
-function androidAutoSaveAvailable() { return Boolean(window.AndroidBridge?.beginReceiveFile && window.AndroidBridge?.writeReceiveChunk && window.AndroidBridge?.finishReceiveFile); }
-function readBridgeJson(raw) { try { return JSON.parse(raw); } catch (_) { return null; } }
+function nativeSaveBridge() {
+  if (window.AndroidBridge?.beginReceiveFile && window.AndroidBridge?.writeReceiveChunk && window.AndroidBridge?.finishReceiveFile) return window.AndroidBridge;
+  if (window.XingqiaoDesktop?.beginReceiveFile && window.XingqiaoDesktop?.writeReceiveChunk && window.XingqiaoDesktop?.finishReceiveFile) return window.XingqiaoDesktop;
+  return null;
+}
+function androidAutoSaveAvailable() {
+  return Boolean(window.AndroidBridge?.beginReceiveFile && window.AndroidBridge?.writeReceiveChunk && window.AndroidBridge?.finishReceiveFile);
+}
+function desktopInboxAvailable() {
+  return Boolean(window.XingqiaoDesktop?.beginReceiveFile && window.XingqiaoDesktop?.writeReceiveChunk && window.XingqiaoDesktop?.finishReceiveFile);
+}
+function nativeSaveAvailable() { return androidAutoSaveAvailable() || desktopInboxAvailable(); }
+function localReceiverKind() {
+  if (androidAutoSaveAvailable()) return "android";
+  return desktopInboxAvailable() ? "desktop" : "browser";
+}
+function readBridgeJson(raw) {
+  if (raw && typeof raw === "object") return raw;
+  try { return JSON.parse(raw); } catch (_) { return null; }
+}
 function setAndroidTransferActive(key, active) {
-  if (!window.AndroidBridge?.setTransferActive) return;
+  const bridge = nativeSaveBridge();
+  if (!bridge?.setTransferActive) return;
   if (active) nativeTransferKeys.add(key);
   else nativeTransferKeys.delete(key);
-  try { window.AndroidBridge.setTransferActive(nativeTransferKeys.size > 0); } catch (_) {}
+  try { bridge.setTransferActive(nativeTransferKeys.size > 0); } catch (_) {}
 }
 function supportsAndroidBinarySave() { return Boolean(window.XingqiaoBinaryBridge?.postMessage); }
 function removeBinaryWriteWaiter(waiter) {
@@ -913,14 +935,23 @@ function bufferToBase64(buffer) {
   for (let offset = 0; offset < bytes.length; offset += 8192) value += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
   return btoa(value);
 }
-function startAndroidSave(name, mime) {
-  if (!androidAutoSaveAvailable()) return null;
-  const result = readBridgeJson(window.AndroidBridge.beginReceiveFile(name, mime));
+async function startAndroidSave(name, mime) {
+  const bridge = nativeSaveBridge();
+  if (!bridge) return null;
+  const result = readBridgeJson(await bridge.beginReceiveFile(name, mime));
   if (result?.binary && !supportsAndroidBinarySave()) result.binary = false;
   return result?.ok ? result : null;
 }
-function finishAndroidSave(token) {
-  return readBridgeJson(window.AndroidBridge.finishReceiveFile(token));
+async function finishAndroidSave(token) {
+  const bridge = nativeSaveBridge();
+  return bridge ? readBridgeJson(await bridge.finishReceiveFile(token)) : null;
+}
+async function writeAndroidSaveChunk(token, base64) {
+  const bridge = nativeSaveBridge();
+  return Boolean(bridge && await bridge.writeReceiveChunk(token, base64));
+}
+function abortAndroidSave(token) {
+  try { nativeSaveBridge()?.abortReceiveFile(token); } catch (_) {}
 }
 
 function mergeArrayBuffers(buffers, byteLength) {
@@ -1020,7 +1051,7 @@ async function prepareDirectDragUrl(resource, name, mime) {
   }
 }
 
-async function rememberReceivedFile(file, resource, saved, folder = "") {
+async function rememberReceivedFile(file, resource, saved, folder = "", nativeInbox = false) {
   const url = resource ? URL.createObjectURL(resource) : "";
   const dragUrl = resource ? await prepareDirectDragUrl(resource, file.savedName || file.name, file.mime) : "";
   state.received.push({
@@ -1034,6 +1065,7 @@ async function rememberReceivedFile(file, resource, saved, folder = "") {
     resource,
     url,
     dragUrl,
+    nativeInbox,
   });
 }
 
@@ -1069,9 +1101,9 @@ async function receive(channel, data) {
           return;
         }
       } else {
-        channel.currentFile.android = startAndroidSave(message.name, message.mime);
-        if (androidAutoSaveAvailable() && !channel.currentFile.android) {
-          stopIncomingChannel(channel, "安卓无法创建保存文件，已停止传输");
+        channel.currentFile.android = await startAndroidSave(message.name, message.mime);
+        if (nativeSaveAvailable() && !channel.currentFile.android) {
+          stopIncomingChannel(channel, "原生收件箱无法创建临时文件，已停止传输");
           return;
         }
         if (channel.currentFile.android?.binary) {
@@ -1091,10 +1123,13 @@ async function receive(channel, data) {
       } else if (file.android) {
         if (!file.androidFailed) {
           if (!await flushAndroidBinaryBuffer(channel)) return;
-          const result = finishAndroidSave(file.android.token);
+          const result = await finishAndroidSave(file.android.token);
           if (result?.ok) {
-            await rememberReceivedFile(file, null, true, result.folder);
-            toast(`已自动保存 ${file.name} 到 ${result.folder}`);
+            await rememberReceivedFile(file, null, true, result.folder, Boolean(result.temporary));
+            if (result.temporary) {
+              try { window.XingqiaoDesktop?.showInbox?.(); } catch (_) {}
+              toast(`${file.name} 已暂存到星桥收件箱，可从悬浮窗拖入聊天`);
+            } else toast(`已自动保存 ${file.name} 到 ${result.folder}`);
           } else toast(`${file.name} 保存失败，请重新接收`);
         }
       } else {
@@ -1136,7 +1171,7 @@ async function receive(channel, data) {
       await flushAndroidBinaryBuffer(channel);
       return;
     }
-    try { if (!window.AndroidBridge.writeReceiveChunk(file.android.token, bufferToBase64(data))) throw new Error("安卓保存通道中断"); }
+    try { if (!await writeAndroidSaveChunk(file.android.token, bufferToBase64(data))) throw new Error("原生保存通道中断"); }
     catch (_) {
       file.androidFailed = true;
       stopIncomingChannel(channel, "安卓保存通道中断，已停止传输");
@@ -1298,7 +1333,7 @@ window.addEventListener("pagehide", () => {
   nativeTransferKeys.clear();
   state.received.forEach(file => { if (file.url) URL.revokeObjectURL(file.url); });
   [...directDragUrls].forEach(url => { discardDirectDragUrl(url); });
-  try { window.AndroidBridge?.setTransferActive?.(false); } catch (_) {}
+  try { nativeSaveBridge()?.setTransferActive?.(false); } catch (_) {}
   peers.forEach(peer => peer.close());
 });
 setupAndroidBinaryBridge();

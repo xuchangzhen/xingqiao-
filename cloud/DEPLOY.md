@@ -18,4 +18,11 @@ docker compose ps
 
 不要提交 `.env`、域名、VPS IP 或 TURN 密钥。若 VPS 已有 Nginx、Caddy 或其他反向代理，请添加一个新的子域名虚拟主机，避免占用或影响既有网站。
 
-日志：`docker compose logs -f`；升级：替换目录文件后执行 `docker compose up -d --build`。
+日志：`docker compose logs -f`；升级时先拉取与桌面端相同的提交，再执行（旧版 Docker 可把 `docker compose` 替换为 `docker-compose`）：
+
+```bash
+git pull --ff-only origin main
+docker compose up -d --build
+```
+
+macOS 桌面端每次启动/刷新都会无缓存加载这个网页入口，所以部署完成后会自动使用同一版网页逻辑；只有原生悬浮收件箱有改动时才需要重新构建 `.app`。
