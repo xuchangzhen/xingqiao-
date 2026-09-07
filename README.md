@@ -14,6 +14,7 @@
 - Android 14 接收内容会自动分类保存：图片到“图片/星桥”、视频到“视频/星桥”、音频到“音乐/星桥”、其他文件到“下载/星桥”。
 - Android App 使用系统自适应图标，并将接收内容通过原生 MediaStore 流式写入，避免网页下载策略因设备不同而失效。
 - macOS 桌面端将点“接收”的文件流式写入本机临时收件箱，并以真实本地文件提供原生拖拽；可拖入 ChatGPT、Codex 等聊天窗口，或点击“保存到…”永久保留。
+- Windows 桌面端同样提供原生悬浮收件箱，可将真实文件拖入聊天窗口；macOS、Windows 和 Android 使用同一套星桥图标。
 - macOS 临时收件箱位于系统缓存目录；未保存文件会在退出星桥时清理，异常退出后的残留会在下次启动时清理。
 - App 与云端页面均禁用传输逻辑缓存，避免更新后继续运行与原生桥接不兼容的旧网页脚本。
 - 若 Android 系统回收 WebView 的媒体渲染进程，App 会自动创建新的页面实例并恢复到可继续选择文件的状态。
@@ -105,6 +106,20 @@ open dist/星桥.app
 
 桌面端使用非持久网页缓存，并在每次启动或点“刷新网页”时从部署地址重新获取页面。因此先将同一提交的 `cloud/` 部署到服务器后，所有桌面端无需重新安装即可得到对应的网页更新；桌面端原生能力变更时，再重新构建并分发 `.app`。
 
+## Windows 桌面端
+
+Windows 10/11 版采用 WPF + Microsoft Edge WebView2。它与 macOS 版具有相同的临时文件生命周期：点“接收”后落盘到 `%LOCALAPPDATA%\Xingqiao\Inbox`，从悬浮收件箱拖出的是真实文件；点击“保存到…”才会永久保存，退出时会清理其余临时文件。
+
+在 Windows 上安装 .NET 8 SDK（以及 Edge WebView2 Runtime；Windows 11 与大多数当前 Windows 10 已预装）后构建：
+
+```powershell
+cd desktop/windows
+./build.ps1
+Start-Process ./dist/XingqiaoDesktop.exe
+```
+
+首次启动时输入自己的 HTTPS 星桥地址。它也会在启动或点击“刷新网页”时加载服务器上的最新网页，因此网页部署和桌面端不需要分别维护两套传输界面。
+
 ## 验证
 
 ```bash
@@ -112,6 +127,7 @@ python3 -m unittest -v tests/test_server.py
 python3 -m unittest -v cloud.test_app
 ./android/gradlew -p "$PWD/android" assembleDebug
 swift build --package-path desktop/macos
+# 在 Windows 上：dotnet build desktop/windows/XingqiaoDesktop.csproj
 ```
 
 ## 隐私与安全

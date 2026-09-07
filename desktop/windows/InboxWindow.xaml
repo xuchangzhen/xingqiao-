@@ -1,0 +1,32 @@
+<Window x:Class="XingqiaoDesktop.InboxWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="星桥临时收件箱" Width="460" Height="330" MinWidth="360" MinHeight="250"
+        WindowStartupLocation="CenterScreen" Topmost="True" ShowInTaskbar="False">
+  <DockPanel Margin="18">
+    <StackPanel DockPanel.Dock="Top">
+      <TextBlock Text="拖动文件到 ChatGPT、Codex 或任意支持文件投放的应用" FontWeight="SemiBold" TextWrapping="Wrap" />
+      <TextBlock Margin="0,5,0,14" Foreground="#63708A" FontSize="12" TextWrapping="Wrap"
+                 Text="文件仅暂存在星桥；点击“保存到…”后才会永久保留。退出星桥会清理其余文件。" />
+    </StackPanel>
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+      <Button x:Name="RemoveButton" Content="移除" Click="Remove_Click" IsEnabled="False" />
+      <Button x:Name="SaveButton" Content="保存到…" Click="Save_Click" IsEnabled="False" />
+    </StackPanel>
+    <Grid>
+      <ListBox x:Name="FilesList" ItemsSource="{Binding Files}" SelectionChanged="FilesList_SelectionChanged"
+               PreviewMouseLeftButtonDown="FilesList_PreviewMouseLeftButtonDown"
+               PreviewMouseMove="FilesList_PreviewMouseMove" BorderBrush="#D8E0EF" BorderThickness="1">
+        <ListBox.ItemTemplate>
+          <DataTemplate>
+            <StackPanel Margin="8,5">
+              <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" FontWeight="SemiBold" />
+              <TextBlock Text="拖出即可使用 · 尚未永久保存" Foreground="#63708A" FontSize="11" />
+            </StackPanel>
+          </DataTemplate>
+        </ListBox.ItemTemplate>
+      </ListBox>
+      <TextBlock x:Name="EmptyText" Text="暂时没有临时文件" Foreground="#77859A" HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False" />
+    </Grid>
+  </DockPanel>
+</Window>

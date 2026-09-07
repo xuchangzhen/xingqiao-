@@ -1,0 +1,26 @@
+<Window x:Class="XingqiaoDesktop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="星桥" Width="1060" Height="760" MinWidth="720" MinHeight="560"
+        Icon="Assets/xingqiao-icon.png" Loaded="Window_Loaded" Closing="Window_Closing">
+  <DockPanel>
+    <Border DockPanel.Dock="Top" Padding="14,10" Background="#F8FAFF" BorderBrush="#E2E8F5" BorderThickness="0,0,0,1">
+      <DockPanel>
+        <StackPanel Orientation="Horizontal">
+          <Image Source="Assets/xingqiao-icon.png" Width="26" Height="26" Margin="0,0,9,0" />
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Text="星桥" FontSize="15" FontWeight="SemiBold" />
+            <TextBlock Text="真实文件拖拽收件箱" Foreground="#63708A" FontSize="11" />
+          </StackPanel>
+        </StackPanel>
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+          <Button Content="临时收件箱" Click="ShowInbox_Click" />
+          <Button Content="刷新网页" Click="Refresh_Click" />
+          <Button Content="更改地址…" Click="ChangeEndpoint_Click" />
+        </StackPanel>
+      </DockPanel>
+    </Border>
+    <wv2:WebView2 x:Name="WebView" />
+  </DockPanel>
+</Window>

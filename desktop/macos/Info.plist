@@ -12,6 +12,8 @@
     <string>com.xingqiao.desktop</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>xingqiao.icns</string>
     <key>CFBundleName</key>
     <string>星桥</string>
     <key>CFBundlePackageType</key>

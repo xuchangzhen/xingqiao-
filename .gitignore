@@ -14,5 +14,9 @@ __pycache__/
 *.apk
 desktop/macos/.build/
 desktop/macos/dist/
+desktop/macos/Assets.iconset/
+desktop/windows/bin/
+desktop/windows/obj/
+desktop/windows/dist/
 xingqiao-cloud.tar.gz
 社交媒体选择文件示例/
