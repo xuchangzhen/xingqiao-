@@ -94,24 +94,25 @@ function addReceivedDragData(event, link, received) {
   const transfer = event.dataTransfer;
   if (!transfer || !received?.resource) return;
   transfer.effectAllowed = "copy";
-  // A real File item is consumable by browser editors, upload areas and apps
-  // that accept file drops. Chromium's DownloadURL additionally supports
-  // dragging the same in-memory resource straight to Finder / Explorer.
+  // Browser upload areas consume the File itself. Do not also offer blob: as a
+  // URL: many chat editors prefer text/uri-list and would paste that unusable
+  // renderer-local URL into the composer instead of accepting the file.
   try { transfer.items?.add(received.resource); } catch (_) {}
-  // A native app cannot dereference blob: URLs from this renderer. The
-  // temporary same-origin URL is handled by drag-worker.js, which returns the
-  // received File from Cache Storage as Chromium materializes the drop.
-  const url = new URL(link.dataset.dragUrl || link.href, location.href).href;
+  const dragURL = link.dataset.dragUrl || "";
   const name = received.name.replaceAll(":", "_");
-  try { transfer.setData("DownloadURL", `${received.mime}:${name}:${url}`); } catch (_) {}
-  try { transfer.setData("text/uri-list", url); } catch (_) {}
-  try { transfer.setData("text/plain", received.name); } catch (_) {}
-  if (received.mime.startsWith("image/")) {
-    const image = document.createElement("img");
-    image.src = url;
-    image.alt = received.name;
-    try { transfer.setData("text/html", image.outerHTML); } catch (_) {}
+  if (/^https?:/i.test(dragURL)) {
+    // DownloadURL is a Chromium-to-Finder/Explorer enhancement. It is only
+    // safe for an actual HTTP(S) address supplied by the drag worker.
+    try { transfer.setData("DownloadURL", `${received.mime}:${name}:${dragURL}`); } catch (_) {}
   }
+}
+
+function desktopShellExpected() {
+  return new URLSearchParams(location.search).has("xingqiao_desktop");
+}
+
+function desktopBridgeUnavailable() {
+  return desktopShellExpected() && !desktopInboxAvailable();
 }
 
 function newTransferProgress(room, files, direction, sender = "") {
@@ -477,6 +478,10 @@ async function acceptFiles(button) {
   if (!selectedIndexes.length) { toast("请先选择至少一个文件"); return; }
   const source = state.rooms.find(room => room.room === button.dataset.room);
   const files = selectedIndexes.map(index => source?.files?.[index]).filter(Boolean);
+  if (desktopBridgeUnavailable()) {
+    toast("桌面原生收件箱未连接；已停止接收，避免错误下载。请安装最新版星桥，并部署服务器网页更新后重试");
+    return;
+  }
   const requiresStreamingFolder = files.some(file => file.size > BROWSER_FALLBACK_MAX_BYTES);
   let folder = null;
   // Some Android WebViews expose showDirectoryPicker but cannot complete it.

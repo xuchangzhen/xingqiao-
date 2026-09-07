@@ -118,7 +118,12 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
         decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
     ) {
         guard let target = navigationAction.request.url else { decisionHandler(.cancel); return }
-        if target.host?.caseInsensitiveCompare(endpoint?.host ?? "") == .orderedSame {
+        // Blob URLs are renderer-local. Sending one to Finder produces the
+        // misleading "no application can open blob:" error; let WebKit handle
+        // it as a normal in-page/download navigation instead.
+        if target.scheme?.caseInsensitiveCompare("blob") == .orderedSame {
+            decisionHandler(.allow)
+        } else if target.host?.caseInsensitiveCompare(endpoint?.host ?? "") == .orderedSame {
             decisionHandler(.allow)
         } else if navigationAction.navigationType == .linkActivated {
             NSWorkspace.shared.open(target)
