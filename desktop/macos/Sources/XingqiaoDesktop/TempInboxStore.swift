@@ -131,6 +131,11 @@ final class TempInboxStore {
         return received
     }
 
+    func file(id: UUID) -> TransferFile? {
+        lock.lock(); defer { lock.unlock() }
+        return received.first { $0.id == id }
+    }
+
     private func safeName(_ value: String) -> String {
         let replaced = value
             .replacingOccurrences(of: "/", with: "_")

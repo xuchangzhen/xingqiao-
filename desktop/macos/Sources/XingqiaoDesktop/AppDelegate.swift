@@ -27,25 +27,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateNow
     }
 
+    func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool { false }
+
+    func applicationShouldHandleReopen(_: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows { browser.show() }
+        return true
+    }
+
     private func installMenu() {
         let main = NSMenu()
         let appItem = NSMenuItem()
         main.addItem(appItem)
-        let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "显示临时收件箱", action: #selector(showInbox), keyEquivalent: "i")
-        appMenu.addItem(withTitle: "刷新网页", action: #selector(reloadWeb), keyEquivalent: "r")
-        appMenu.addItem(withTitle: "更改网页地址…", action: #selector(changeEndpoint), keyEquivalent: ",")
-        appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "退出星桥", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        appItem.submenu = appMenu
+        appItem.submenu = makeMenu(includeQuit: true)
         NSApp.mainMenu = main
 
         let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.title = "✦ 星桥"
-        status.menu = appMenu.copy() as? NSMenu
+        status.menu = makeMenu(includeQuit: true)
         statusItem = status
     }
 
+    private func makeMenu(includeQuit: Bool) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(actionItem("显示星桥", action: #selector(showWindow), keyEquivalent: ""))
+        menu.addItem(actionItem("显示临时收件箱", action: #selector(showInbox), keyEquivalent: "i"))
+        menu.addItem(actionItem("刷新网页", action: #selector(reloadWeb), keyEquivalent: "r"))
+        menu.addItem(actionItem("更改网页地址…", action: #selector(changeEndpoint), keyEquivalent: ","))
+        if includeQuit {
+            menu.addItem(.separator())
+            let quit = NSMenuItem(title: "退出星桥", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+            quit.target = NSApp
+            menu.addItem(quit)
+        }
+        return menu
+    }
+
+    private func actionItem(_ title: String, action: Selector, keyEquivalent: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = self
+        return item
+    }
+
+    @objc private func showWindow() { browser.show() }
     @objc private func showInbox() { shelf.show() }
     @objc private func reloadWeb() { browser.reloadFromOrigin() }
     @objc private func changeEndpoint() { browser.promptForEndpoint() }

@@ -2,12 +2,17 @@ import AppKit
 import WebKit
 
 @MainActor
-final class BrowserWindowController: NSWindowController, WKNavigationDelegate {
+final class BrowserWindowController: NSWindowController, WKNavigationDelegate, NSWindowDelegate {
     private let bridge: DesktopBridge
     private let webView: WKWebView
+    private let dragOverlay: NativeFileDragOverlayView
     private var endpoint: URL?
 
     init(store: TempInboxStore, shelf: InboxPanelController) {
+        dragOverlay = NativeFileDragOverlayView(
+            fileURL: { id in store.file(id: id)?.path },
+            didClick: { shelf.show() }
+        )
         bridge = DesktopBridge(store: store, shelf: shelf)
         let configuration = WKWebViewConfiguration()
         // The web shell always comes from the deployed endpoint. A non-persistent
@@ -35,15 +40,23 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate {
         window.minSize = NSSize(width: 720, height: 560)
         super.init(window: window)
         webView.translatesAutoresizingMaskIntoConstraints = false
+        dragOverlay.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = NSView()
         window.contentView?.addSubview(webView)
+        window.contentView?.addSubview(dragOverlay)
         NSLayoutConstraint.activate([
             webView.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
             webView.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
             webView.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
+            dragOverlay.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
+            dragOverlay.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
+            dragOverlay.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
+            dragOverlay.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
         ])
         webView.navigationDelegate = self
+        window.delegate = self
+        bridge.nativeDragTargetHandler = { [weak self] targets in self?.dragOverlay.update(targets: targets) }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -53,13 +66,22 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate {
             promptForEndpoint()
             return
         }
-        load(url)
+        if webView.url == nil { load(url) }
+        show()
+    }
+
+    func show() {
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func reloadFromOrigin() { webView.reloadFromOrigin() }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
 
     func promptForEndpoint() {
         let alert = NSAlert()
@@ -123,6 +145,7 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate {
     private func load(_ url: URL) {
         endpoint = url
         bridge.trustedOrigin = nil
+        dragOverlay.update(targets: [])
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         var query = components?.queryItems ?? []
         query.append(URLQueryItem(name: "xingqiao_desktop", value: "1"))
@@ -154,6 +177,7 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
         abortReceiveFile: token => call('abortReceiveFile', { token }),
         setTransferActive: active => call('setTransferActive', { active: !!active }),
         showInbox: () => call('showInbox'),
+        syncNativeDragTargets: targets => call('syncNativeDragTargets', { targets }),
       });
     })();
     """
@@ -161,6 +185,7 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
     private let store: TempInboxStore
     private weak var shelf: InboxPanelController?
     var trustedOrigin: URL?
+    var nativeDragTargetHandler: (([NativeFileDragTarget]) -> Void)?
 
     init(store: TempInboxStore, shelf: InboxPanelController) {
         self.store = store
@@ -193,9 +218,9 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
                 replyHandler(true, nil)
             case "finishReceiveFile":
                 guard let token = body["token"] as? String else { throw InboxError.unknownToken }
-                _ = try store.finish(token: token)
+                let file = try store.finish(token: token)
                 shelf?.show()
-                replyHandler(["ok": true, "folder": "星桥临时收件箱", "temporary": true], nil)
+                replyHandler(["ok": true, "folder": "星桥临时收件箱", "temporary": true, "nativeFileId": file.id.uuidString], nil)
             case "abortReceiveFile":
                 if let token = body["token"] as? String { store.abort(token: token) }
                 replyHandler(true, nil)
@@ -203,6 +228,9 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
                 shelf?.show()
                 replyHandler(true, nil)
             case "setTransferActive":
+                replyHandler(true, nil)
+            case "syncNativeDragTargets":
+                nativeDragTargetHandler?(nativeTargets(from: body["targets"]))
                 replyHandler(true, nil)
             default:
                 replyHandler(["ok": false, "error": "未知请求"], nil)
@@ -220,5 +248,24 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
               message.frameInfo.securityOrigin.protocol.caseInsensitiveCompare(origin.scheme ?? "") == .orderedSame
         else { return false }
         return true
+    }
+
+    private func nativeTargets(from rawValue: Any?) -> [NativeFileDragTarget] {
+        guard let values = rawValue as? [[String: Any]] else { return [] }
+        return values.prefix(100).compactMap { value in
+            guard let rawID = value["id"] as? String,
+                  let fileID = UUID(uuidString: rawID),
+                  store.file(id: fileID) != nil,
+                  let x = number(value["x"]), let y = number(value["y"]),
+                  let width = number(value["width"]), let height = number(value["height"])
+            else { return nil }
+            return NativeFileDragTarget(fileID: fileID, x: x, y: y, width: width, height: height)
+        }
+    }
+
+    private func number(_ value: Any?) -> CGFloat? {
+        if let number = value as? NSNumber { return CGFloat(truncating: number) }
+        if let number = value as? Double { return CGFloat(number) }
+        return nil
     }
 }
