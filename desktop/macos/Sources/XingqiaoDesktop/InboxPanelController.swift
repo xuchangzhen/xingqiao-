@@ -7,6 +7,7 @@ final class InboxPanelController: NSWindowController, NSTableViewDataSource, NST
     private let emptyLabel = NSTextField(labelWithString: "暂时没有临时文件")
     private let saveButton = NSButton(title: "保存到…", target: nil, action: nil)
     private let discardButton = NSButton(title: "移除", target: nil, action: nil)
+    private var selectedFileID: UUID?
 
     init(store: TempInboxStore) {
         self.store = store
@@ -23,7 +24,7 @@ final class InboxPanelController: NSWindowController, NSTableViewDataSource, NST
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         super.init(window: panel)
         buildInterface(in: panel)
-        store.onChange = { [weak self] in self?.reload() }
+        store.onChange = { [weak self] in self?.reload(selectNewest: true) }
         reload()
     }
 
@@ -108,8 +109,20 @@ final class InboxPanelController: NSWindowController, NSTableViewDataSource, NST
         ])
     }
 
-    private func reload() {
+    private func reload(selectNewest: Bool = false) {
+        let files = store.files()
+        let requestedID = selectedFileID ?? (selectNewest ? files.first?.id : nil)
         tableView.reloadData()
+        if let requestedID, let row = files.firstIndex(where: { $0.id == requestedID }) {
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        } else {
+            tableView.deselectAll(nil)
+            selectedFileID = nil
+        }
+        updateControls()
+    }
+
+    private func updateControls() {
         let hasFiles = !store.files().isEmpty
         emptyLabel.isHidden = hasFiles
         saveButton.isEnabled = selectedFile != nil
@@ -148,7 +161,10 @@ final class InboxPanelController: NSWindowController, NSTableViewDataSource, NST
         return cell
     }
 
-    func tableViewSelectionDidChange(_: Notification) { reload() }
+    func tableViewSelectionDidChange(_: Notification) {
+        selectedFileID = selectedFile?.id
+        updateControls()
+    }
 
     func tableView(_: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         let files = store.files()
