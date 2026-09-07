@@ -1,4 +1,5 @@
 import AppKit
+import WebKit
 
 @MainActor
 struct NativeFileDragTarget {
@@ -9,87 +10,58 @@ struct NativeFileDragTarget {
     let height: CGFloat
 }
 
-/// Transparent native hit targets placed above the corresponding WebView cards.
-/// WebKit may render a DOM drag, but it cannot put arbitrary local file URLs on
-/// the macOS pasteboard. These handles start an AppKit file drag instead.
+/// WebKit consumes gestures before a transparent sibling view can reliably
+/// receive them. This view recognizes mapped DOM rectangles at the event
+/// source itself and exports the backing temporary file as a normal macOS
+/// `file://` drag. Other apps therefore receive a real file, not a `blob:` URL.
 @MainActor
-final class NativeFileDragOverlayView: NSView {
+final class NativeFileDragWebView: WKWebView, NSDraggingSource {
     private let fileURL: (UUID) -> URL?
     private let didClick: () -> Void
-    private var handles: [UUID: NativeFileDragHandle] = [:]
-
-    init(fileURL: @escaping (UUID) -> URL?, didClick: @escaping () -> Void) {
-        self.fileURL = fileURL
-        self.didClick = didClick
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-    }
-
-    required init?(coder: NSCoder) { nil }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        for handle in subviews.reversed() {
-            let local = handle.convert(point, from: self)
-            if let hit = handle.hitTest(local) { return hit }
-        }
-        return nil
-    }
-
-    func update(targets: [NativeFileDragTarget]) {
-        let visible = Set(targets.map(\.fileID))
-        let staleIDs = handles.keys.filter { !visible.contains($0) }
-        for id in staleIDs {
-            handles.removeValue(forKey: id)?.removeFromSuperview()
-        }
-
-        for target in targets {
-            guard target.width > 1, target.height > 1 else { continue }
-            let handle = handles[target.fileID] ?? {
-                let created = NativeFileDragHandle(fileID: target.fileID, fileURL: fileURL, didClick: didClick)
-                addSubview(created)
-                handles[target.fileID] = created
-                return created
-            }()
-            // DOM rectangles are measured from the WebView's upper left, while
-            // AppKit's default coordinate system starts at the lower left.
-            handle.frame = NSRect(
-                x: target.x,
-                y: bounds.height - target.y - target.height,
-                width: target.width,
-                height: target.height
-            ).intersection(bounds)
-        }
-    }
-}
-
-@MainActor
-private final class NativeFileDragHandle: NSView, NSDraggingSource {
-    private let fileID: UUID
-    private let fileURL: (UUID) -> URL?
-    private let didClick: () -> Void
+    private var targetsByID: [UUID: NativeFileDragTarget] = [:]
+    private var pressedFileID: UUID?
     private var isDraggingFile = false
 
-    init(fileID: UUID, fileURL: @escaping (UUID) -> URL?, didClick: @escaping () -> Void) {
-        self.fileID = fileID
+    init(
+        frame: NSRect,
+        configuration: WKWebViewConfiguration,
+        fileURL: @escaping (UUID) -> URL?,
+        didClick: @escaping () -> Void
+    ) {
         self.fileURL = fileURL
         self.didClick = didClick
-        super.init(frame: .zero)
-        toolTip = "拖动即可将真实文件交给聊天窗口；点击打开临时收件箱"
+        super.init(frame: frame, configuration: configuration)
     }
 
     required init?(coder: NSCoder) { nil }
 
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .openHand)
+    func updateNativeDragTargets(_ targets: [NativeFileDragTarget]) {
+        targetsByID = Dictionary(uniqueKeysWithValues: targets.map { ($0.fileID, $0) })
+        if let pressedFileID, targetsByID[pressedFileID] == nil {
+            self.pressedFileID = nil
+            isDraggingFile = false
+        }
     }
 
-    override func mouseDown(with _: NSEvent) {
+    override func mouseDown(with event: NSEvent) {
+        guard let fileID = nativeFileID(at: event) else {
+            super.mouseDown(with: event)
+            return
+        }
+        pressedFileID = fileID
         isDraggingFile = false
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard !isDraggingFile, let url = fileURL(fileID), FileManager.default.fileExists(atPath: url.path) else { return }
+        guard let fileID = pressedFileID else {
+            super.mouseDragged(with: event)
+            return
+        }
+        guard !isDraggingFile,
+              let url = fileURL(fileID),
+              FileManager.default.fileExists(atPath: url.path)
+        else { return }
+
         isDraggingFile = true
         let dragImage = NSWorkspace.shared.icon(forFile: url.path)
         dragImage.size = NSSize(width: 56, height: 56)
@@ -98,9 +70,27 @@ private final class NativeFileDragHandle: NSView, NSDraggingSource {
         beginDraggingSession(with: [item], event: event, source: self)
     }
 
-    override func mouseUp(with _: NSEvent) {
-        if !isDraggingFile { didClick() }
+    override func mouseUp(with event: NSEvent) {
+        guard pressedFileID != nil else {
+            super.mouseUp(with: event)
+            return
+        }
+        let wasDragging = isDraggingFile
+        pressedFileID = nil
+        isDraggingFile = false
+        if !wasDragging { didClick() }
     }
 
     func draggingSession(_: NSDraggingSession, sourceOperationMaskFor _: NSDraggingContext) -> NSDragOperation { .copy }
+
+    private func nativeFileID(at event: NSEvent) -> UUID? {
+        let point = convert(event.locationInWindow, from: nil)
+        // DOM getBoundingClientRect starts at the upper-left. NSView's default
+        // coordinate system starts at the lower-left, so normalize before
+        // comparing with coordinates supplied by the web page.
+        let domPoint = CGPoint(x: point.x, y: isFlipped ? point.y : bounds.height - point.y)
+        return targetsByID.values.first { target in
+            NSRect(x: target.x, y: target.y, width: target.width, height: target.height).contains(domPoint)
+        }?.fileID
+    }
 }
