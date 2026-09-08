@@ -31,19 +31,23 @@ public sealed class DesktopBridge
         abortReceiveFile: token => call('abortReceiveFile', { token }),
         setTransferActive: active => call('setTransferActive', { active: !!active }),
         showInbox: () => call('showInbox'),
+        checkForUpdate: () => call('checkForUpdate'),
+        appVersion: () => call('appVersion'),
       });
     })();
     """;
 
     private readonly TempInboxStore _store;
     private readonly InboxWindow _shelf;
+    private readonly Action _checkForUpdate;
 
     public Uri? TrustedOrigin { get; set; }
 
-    public DesktopBridge(TempInboxStore store, InboxWindow shelf)
+    public DesktopBridge(TempInboxStore store, InboxWindow shelf, Action checkForUpdate)
     {
         _store = store;
         _shelf = shelf;
+        _checkForUpdate = checkForUpdate;
     }
 
     public void Handle(string source, string json, Action<string> reply)
@@ -63,6 +67,8 @@ public sealed class DesktopBridge
                 "finishReceiveFile" => Finish(ReadString(root, "token")),
                 "abortReceiveFile" => Abort(ReadString(root, "token")),
                 "showInbox" => ShowInbox(),
+                "checkForUpdate" => CheckForUpdate(),
+                "appVersion" => new { version = DesktopUpdateService.CurrentVersion },
                 "setTransferActive" => new { ok = true },
                 _ => new { ok = false, error = "未知请求" },
             };
@@ -104,6 +110,12 @@ public sealed class DesktopBridge
     private object ShowInbox()
     {
         _shelf.ShowInbox();
+        return true;
+    }
+
+    private object CheckForUpdate()
+    {
+        _checkForUpdate();
         return true;
     }
 

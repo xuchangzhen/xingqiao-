@@ -1285,8 +1285,10 @@ function base64ToBytes(value) {
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
   return bytes;
 }
+let nativeAppVersion = "";
 function updateButton() { return $("#checkUpdate"); }
-function showAndroidUpdate(raw) {
+function updateButtonLabel(label) { return nativeAppVersion ? `v${nativeAppVersion} · ${label}` : label; }
+function showNativeUpdate(raw) {
   const message = readBridgeJson(raw) || raw || {};
   const button = updateButton();
   if (!button) return;
@@ -1294,33 +1296,59 @@ function showAndroidUpdate(raw) {
   const status = message.status;
   if (status === "checking") {
     button.disabled = true;
-    button.textContent = "检查更新中…";
+    button.textContent = updateButtonLabel("检查中…");
   } else if (status === "downloading") {
     button.disabled = true;
     button.textContent = `下载 v${message.version || ""}…`;
     toast("正在下载新版本，下载完成后会打开系统安装确认");
   } else if (status === "ready") {
     button.disabled = false;
-    button.textContent = "重新检查";
+    button.textContent = updateButtonLabel("重新检查");
     toast("安装包已准备好，请在系统安装确认中完成更新");
   } else if (status === "latest") {
     button.disabled = false;
-    button.textContent = "已是最新";
+    button.textContent = updateButtonLabel("已是最新");
     toast("当前已是最新版本");
   } else {
     button.disabled = false;
-    button.textContent = "检查更新";
+    button.textContent = updateButtonLabel("检查更新");
     if (message.message) toast(message.message);
   }
 }
 
-window.XingqiaoNative = { onUpdateStatus: showAndroidUpdate };
+window.XingqiaoNative = { onUpdateStatus: showNativeUpdate };
 
-function setupAndroidUpdate() {
+async function setupNativeUpdate() {
   const button = updateButton();
-  if (!button || !window.AndroidBridge?.checkForUpdate) return;
+  const bridge = window.AndroidBridge?.checkForUpdate ? window.AndroidBridge : window.XingqiaoDesktop?.checkForUpdate ? window.XingqiaoDesktop : null;
+  if (!button || !bridge) return;
   button.hidden = false;
-  button.onclick = () => window.AndroidBridge.checkForUpdate();
+  button.textContent = updateButtonLabel("检查更新");
+  button.onclick = async () => {
+    try {
+      button.disabled = true;
+      button.textContent = updateButtonLabel("检查中…");
+      await Promise.resolve(bridge.checkForUpdate());
+      // Android reports progress through XingqiaoNative. macOS and Windows
+      // present a native dialog, so restore this web button once it hands off.
+      if (bridge === window.XingqiaoDesktop) {
+        button.disabled = false;
+        button.textContent = updateButtonLabel("检查更新");
+      }
+    } catch (_) {
+      button.disabled = false;
+      button.textContent = updateButtonLabel("检查更新");
+      toast("无法检查更新，请稍后重试");
+    }
+  };
+  try {
+    const result = await Promise.resolve(bridge.appVersion?.());
+    const version = typeof result === "string" ? result : result?.version;
+    if (version) {
+      nativeAppVersion = String(version).replace(/^[vV]/, "");
+      button.textContent = updateButtonLabel("检查更新");
+    }
+  } catch (_) {}
 }
 
 async function importAndroidSharedFiles() {
@@ -1374,4 +1402,4 @@ window.addEventListener("pagehide", () => {
 });
 setupAndroidBinaryBridge();
 setMode("photos"); renderFiles(); importAndroidSharedFiles(); connect();
-setupAndroidUpdate();
+setupNativeUpdate();

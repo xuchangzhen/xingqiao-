@@ -11,7 +11,8 @@ def releaseValue = { name ->
 }
 def hasReleaseSigning = ["storeFile", "storePassword", "keyAlias", "keyPassword"].every { releaseValue(it) }
 def configuredWebUrl = (project.findProperty("XINGQIAO_DEFAULT_WEB_URL") ?: System.getenv("XINGQIAO_DEFAULT_WEB_URL") ?: "").toString().replace("\\", "\\\\").replace("\"", "\\\"")
-def configuredUpdateApiUrl = (project.findProperty("XINGQIAO_UPDATE_API_URL") ?: System.getenv("XINGQIAO_UPDATE_API_URL") ?: "").toString().replace("\\", "\\\\").replace("\"", "\\\"")
+def defaultUpdateApiUrl = "https://api.github.com/repos/xuchangzhen/xingqiao-/releases/latest"
+def configuredUpdateApiUrl = (project.findProperty("XINGQIAO_UPDATE_API_URL") ?: System.getenv("XINGQIAO_UPDATE_API_URL") ?: defaultUpdateApiUrl).toString().replace("\\", "\\\\").replace("\"", "\\\"")
 
 android {
     namespace "com.xingqiao.android"
@@ -20,8 +21,8 @@ android {
         applicationId "com.xingqiao.android"
         minSdk 26
         targetSdk 35
-        versionCode 17
-        versionName "1.4.3"
+        versionCode 18
+        versionName "1.4.4"
         buildConfigField "String", "DEFAULT_WEB_URL", "\"${configuredWebUrl}\""
         buildConfigField "String", "UPDATE_API_URL", "\"${configuredUpdateApiUrl}\""
     }

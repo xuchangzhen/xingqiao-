@@ -592,6 +592,7 @@ public class MainActivity extends Activity {
 
     final class ShareBridge {
         @android.webkit.JavascriptInterface public void checkForUpdate() { if (isTrustedBridgeCall()) MainActivity.this.checkForUpdate(); }
+        @android.webkit.JavascriptInterface public String appVersion() { return BuildConfig.VERSION_NAME; }
         /** A user-initiated transfer may continue after the Activity is backgrounded. */
         @android.webkit.JavascriptInterface public void setTransferActive(boolean active) {
             if (!isTrustedBridgeCall()) return;

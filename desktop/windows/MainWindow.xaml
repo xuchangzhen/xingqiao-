@@ -11,12 +11,16 @@
           <Image Source="Assets/xingqiao-icon.png" Width="26" Height="26" Margin="0,0,9,0" />
           <StackPanel VerticalAlignment="Center">
             <TextBlock Text="星桥" FontSize="15" FontWeight="SemiBold" />
-            <TextBlock Text="真实文件拖拽收件箱" Foreground="#63708A" FontSize="11" />
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="真实文件拖拽收件箱" Foreground="#63708A" FontSize="11" />
+              <TextBlock x:Name="VersionText" Foreground="#63708A" FontSize="11" Margin="8,0,0,0" />
+            </StackPanel>
           </StackPanel>
         </StackPanel>
         <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
           <Button Content="临时收件箱" Click="ShowInbox_Click" />
           <Button Content="刷新网页" Click="Refresh_Click" />
+          <Button x:Name="UpdateButton" Content="检查更新" Click="CheckUpdate_Click" />
           <Button Content="更改地址…" Click="ChangeEndpoint_Click" />
         </StackPanel>
       </DockPanel>
