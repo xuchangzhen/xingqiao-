@@ -18,6 +18,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         shelf = InboxPanelController(store: store)
         browser = BrowserWindowController(store: store, shelf: shelf)
+        shelf.configureQuickActions(
+            acceptPending: { [weak self] in self?.browser.acceptNextWaitingTransfer() },
+            sendFiles: { [weak self] in self?.browser.startQuickSend() }
+        )
         installMenu()
         browser.open()
     }

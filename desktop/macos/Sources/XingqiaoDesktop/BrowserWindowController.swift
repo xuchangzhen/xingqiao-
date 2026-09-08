@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import WebKit
 
 @MainActor
@@ -6,11 +7,13 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
     private let bridge: DesktopBridge
     private let webView: NativeFileDragWebView
     private let updateService = DesktopUpdateService()
+    private weak var shelf: InboxPanelController?
     private let versionLabel = NSTextField(labelWithString: "")
     private let updateButton = NSButton(title: "检查更新", target: nil, action: nil)
     private var endpoint: URL?
 
     init(store: TempInboxStore, shelf: InboxPanelController) {
+        self.shelf = shelf
         bridge = DesktopBridge(store: store, shelf: shelf)
         let configuration = WKWebViewConfiguration()
         // The web shell always comes from the deployed endpoint. A non-persistent
@@ -82,6 +85,7 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
         window.delegate = self
         bridge.nativeDragTargetHandler = { [weak self] targets in self?.webView.updateNativeDragTargets(targets) }
         bridge.checkForUpdateHandler = { [weak self] in self?.checkForUpdates() }
+        bridge.pendingReceiveCountHandler = { [weak shelf] count in shelf?.updatePendingReceives(count) }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -102,6 +106,74 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
     }
 
     func reloadFromOrigin() { webView.reloadFromOrigin() }
+
+    /// Accept the first visible transfer from the always-connected hidden web
+    /// shell. The main window stays hidden, so this can be used from the tray
+    /// or the floating inbox without opening the dashboard.
+    func acceptNextWaitingTransfer() {
+        runQuickAction(
+            "window.XingqiaoQuickActions?.acceptNext?.() ?? 'needs-update'",
+            success: "正在建立接收连接…",
+            unavailable: "暂无等待接收的内容，或服务器网页尚未更新。"
+        )
+    }
+
+    /// The floating inbox can begin a send without showing the dashboard. The
+    /// selected URLs remain native files; JavaScript streams only the next
+    /// transfer block on demand instead of copying an entire file into memory.
+    func startQuickSend() {
+        guard let shelfWindow = shelf?.window else {
+            shelf?.reportQuickAction("发送入口尚未准备好，请稍后重试。")
+            return
+        }
+        let picker = NSOpenPanel()
+        picker.title = "选择要通过星桥发送的文件"
+        picker.prompt = "加入发送"
+        picker.canChooseFiles = true
+        picker.canChooseDirectories = false
+        picker.allowsMultipleSelection = true
+        picker.beginSheetModal(for: shelfWindow) { [weak self] response in
+            guard response == .OK, let self else { return }
+            let files = self.bridge.registerOutgoingFiles(picker.urls)
+            guard !files.isEmpty else {
+                self.shelf?.reportQuickAction("没有可发送的文件。")
+                return
+            }
+            do {
+                let payload = try JSONSerialization.data(withJSONObject: files)
+                guard let json = String(data: payload, encoding: .utf8) else { throw NSError(domain: "星桥", code: 1) }
+                self.webView.evaluateJavaScript("window.XingqiaoQuickActions?.addNativeFiles?.(\(json)) ?? 'needs-update'") { [weak self] result, error in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        if error != nil || (result as? String) == "needs-update" {
+                            self.shelf?.reportQuickAction("网页尚未更新；请刷新后重试。")
+                        } else if (result as? String) == "busy" {
+                            self.shelf?.reportQuickAction("当前批次正在发送，完成后再添加文件。")
+                        } else if (result as? String) == "none" {
+                            self.shelf?.reportQuickAction("没有可加入发送区的文件。")
+                        } else {
+                            self.shelf?.reportQuickAction("已加入 \(files.count) 个文件，可在网页发送区点击“开始发送”。")
+                        }
+                    }
+                }
+            } catch {
+                self.shelf?.reportQuickAction("无法准备所选文件。")
+            }
+        }
+    }
+
+    private func runQuickAction(_ script: String, success: String, unavailable: String) {
+        webView.evaluateJavaScript(script) { [weak self] result, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if error != nil || (result as? String) == "needs-update" || (result as? String) == "none" {
+                    self.shelf?.reportQuickAction(unavailable)
+                } else {
+                    self.shelf?.reportQuickAction(success)
+                }
+            }
+        }
+    }
 
     @objc func checkForUpdates() {
         guard updateButton.isEnabled else { return }
@@ -264,6 +336,8 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
         showInbox: () => call('showInbox'),
         syncNativeDragTargets: targets => call('syncNativeDragTargets', { targets }),
         checkForUpdate: () => call('checkForUpdate'),
+        updateInboxStatus: status => call('updateInboxStatus', { status }),
+        readSendFileChunk: (token, offset, length) => call('readSendFileChunk', { token, offset, length }),
         appVersion: () => call('appVersion'),
       });
     })();
@@ -271,9 +345,11 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
 
     private let store: TempInboxStore
     private weak var shelf: InboxPanelController?
+    private var outgoingFiles: [UUID: URL] = [:]
     var trustedOrigin: URL?
     var nativeDragTargetHandler: (([NativeFileDragTarget]) -> Void)?
     var checkForUpdateHandler: (() -> Void)?
+    var pendingReceiveCountHandler: ((Int) -> Void)?
 
     init(store: TempInboxStore, shelf: InboxPanelController) {
         self.store = store
@@ -318,6 +394,17 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
             case "checkForUpdate":
                 checkForUpdateHandler?()
                 replyHandler(true, nil)
+            case "updateInboxStatus":
+                let status = body["status"] as? [String: Any]
+                let count = max(0, (status?["waitingReceives"] as? NSNumber)?.intValue ?? 0)
+                pendingReceiveCountHandler?(min(count, 99))
+                replyHandler(true, nil)
+            case "readSendFileChunk":
+                guard let token = body["token"] as? String,
+                      let offset = (body["offset"] as? NSNumber)?.int64Value,
+                      let length = (body["length"] as? NSNumber)?.int64Value
+                else { throw InboxError.unknownToken }
+                replyHandler(try readOutgoingChunk(token: token, offset: offset, length: length), nil)
             case "appVersion":
                 replyHandler(["version": DesktopUpdateService.currentVersion], nil)
             case "setTransferActive":
@@ -361,5 +448,36 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
         if let number = value as? NSNumber { return CGFloat(truncating: number) }
         if let number = value as? Double { return CGFloat(number) }
         return nil
+    }
+
+    func registerOutgoingFiles(_ urls: [URL]) -> [[String: Any]] {
+        let limit: Int64 = 4 * 1024 * 1024 * 1024
+        return urls.prefix(40).compactMap { url in
+            guard url.isFileURL,
+                  let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentTypeKey]),
+                  let size = values.fileSize.map(Int64.init), size > 0, size <= limit
+            else { return nil }
+            let token = UUID()
+            outgoingFiles[token] = url
+            return [
+                "token": token.uuidString,
+                "name": url.lastPathComponent,
+                "size": size,
+                "type": values.contentType?.preferredMIMEType ?? "application/octet-stream",
+            ]
+        }
+    }
+
+    private func readOutgoingChunk(token: String, offset: Int64, length: Int64) throws -> [String: Any] {
+        let maximumChunk: Int64 = 8 * 1024 * 1024
+        guard let id = UUID(uuidString: token), let url = outgoingFiles[id], offset >= 0, length > 0 else { throw InboxError.unknownToken }
+        let size = (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+        guard offset < size else { return ["ok": true, "base64": "", "bytes": 0] }
+        let bytesToRead = Int(min(length, maximumChunk, size - offset))
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(offset))
+        let data = try handle.read(upToCount: bytesToRead) ?? Data()
+        return ["ok": true, "base64": data.base64EncodedString(), "bytes": data.count]
     }
 }
