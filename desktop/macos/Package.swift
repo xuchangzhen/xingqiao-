@@ -11,6 +11,7 @@ let package = Package(
             path: "Sources/XingqiaoDesktop",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("QuickLookUI"),
                 .linkedFramework("WebKit"),
             ]
         ),

@@ -29,8 +29,16 @@
 .received-preview-link { position: relative; display: block; overflow: hidden; border: 1px solid #b9d4fb; border-radius: 15px; background: #eef4fd; box-shadow: 0 10px 24px #4d7ec31c; color: inherit; cursor: grab; text-decoration: none; }
 .received-preview-link:hover { border-color: #6da4f5; box-shadow: 0 13px 28px #4d7ec333; }
 .received-preview-link:active { cursor: grabbing; }
-.received-preview-link .file-preview { display: block; height: min(300px, 38vw); max-height: 300px; background: #eef2f7; object-fit: contain; }
+.received-preview-link .file-preview { display: block; height: min(220px, 31vw); max-height: 220px; background: #eef2f7; object-fit: contain; }
 .received-preview-link span { display: block; padding: 8px 11px; border-top: 1px solid #d8e6fa; color: #3866a8; font-size: 12px; font-weight: 650; text-align: center; }
+.native-inbox-actions { grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; }
+.native-inbox { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #a8c8fa; background: #eaf3ff; color: #284d82; text-align: left; }
+.native-inbox strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.native-inbox span { flex: none; color: #5273a0; font-size: 11px; }
+.native-direct-drag { cursor: grab; }
+.native-direct-drag:active { cursor: grabbing; }
+.native-inbox-open { border: 0; border-radius: 10px; background: transparent; color: #3564ac; padding: 8px 5px; font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; }
+.native-inbox-open:hover { background: #eaf3ff; }
 .transfer-top .accept { margin-left: auto; padding: 8px 14px; font-size: 12px; }
 .select-row { display: flex; justify-content: space-between; align-items: center; margin: 13px 0 -2px 43px; color: var(--muted); font-size: 11px; }
 .select-row label, .receive-file { cursor: pointer; }
@@ -47,4 +55,4 @@
 .received-resource { background: #eaf3ff; box-shadow: inset 0 0 0 1px #a8c8fa; }
 
 @media (max-width: 760px) { .mode-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 620px) { .clipboard-panel, .social-panel { grid-template-columns: 1fr; } .clipboard-panel .secondary { justify-self: start; } .social-actions { justify-content: flex-start; } .send-row { gap: 12px; } .send-actions { flex: none; } .header-actions { gap: 6px; } .update-button { padding: 7px 9px; } .transfer-progress.compact { margin-left: 0; } .transfer-preview { padding-left: 0; } .received-preview-link .file-preview { height: 250px; } .progress-copy { align-items: flex-start; flex-direction: column; gap: 3px; } }
+@media (max-width: 620px) { .clipboard-panel, .social-panel { grid-template-columns: 1fr; } .clipboard-panel .secondary { justify-self: start; } .social-actions { justify-content: flex-start; } .send-row { gap: 12px; } .send-actions { flex: none; } .header-actions { gap: 6px; } .update-button { padding: 7px 9px; } .transfer-progress.compact { margin-left: 0; } .transfer-preview { padding-left: 0; } .received-preview-link .file-preview { height: 190px; } .native-inbox-actions { grid-template-columns: 1fr; } .native-inbox-open { justify-self: start; } .progress-copy { align-items: flex-start; flex-direction: column; gap: 3px; } }
