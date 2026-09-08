@@ -12,6 +12,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("QuickLookUI"),
+                .linkedFramework("QuickLookThumbnailing"),
                 .linkedFramework("WebKit"),
             ]
         ),

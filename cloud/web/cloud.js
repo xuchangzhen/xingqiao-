@@ -460,11 +460,75 @@ function nativeInboxControls(file) {
   return `<div class="transfer-files native-inbox-actions"><button class="secondary native-inbox" data-open-native-inbox title="打开临时收件箱"><strong>${name}</strong><span>${details} · 点击打开收件箱后拖出</span></button><button class="native-inbox-open" data-open-native-inbox title="打开临时收件箱后可预览、选择或保存">打开收件箱 / 预览</button></div>`;
 }
 
-function renderIncoming() {
+function waitingReceiveRooms() {
   const ownPendingRoom = state.pendingHost?.room;
-  const activeRooms = new Set(state.incomingProgress.keys());
+  return state.rooms.filter(room => room.room !== state.hosted && room.room !== ownPendingRoom && !state.incomingProgress.has(room.room) && !state.dismissedRooms.has(room.room));
+}
+
+function syncNativeInboxStatus(waitingCount) {
+  const bridge = window.XingqiaoDesktop;
+  if (!bridge?.updateInboxStatus) return;
+  Promise.resolve(bridge.updateInboxStatus({ waitingReceives: waitingCount })).catch(() => {});
+}
+
+// Native desktop files are represented as a tiny File-like object. Its bytes
+// remain on disk and are pulled through the trusted bridge per transfer block,
+// so using the floating inbox to send a large video does not duplicate it in
+// WebKit memory just to populate an <input type=file>.
+function nativeSendFile(meta) {
+  const bridge = window.XingqiaoDesktop;
+  const total = Number(meta?.size) || 0;
+  const token = String(meta?.token || "");
+  const read = async (start, end) => {
+    const result = await Promise.resolve(bridge.readSendFileChunk(token, start, end - start));
+    if (!result?.ok) throw new Error("无法读取要发送的文件");
+    return base64ToBytes(result.base64 || "").buffer;
+  };
+  return {
+    name: String(meta?.name || "星桥发送文件"),
+    size: total,
+    type: String(meta?.type || "application/octet-stream"),
+    slice(start = 0, end = total) {
+      const from = Math.max(0, Math.min(total, Number(start) || 0));
+      const to = Math.max(from, Math.min(total, Number(end) || total));
+      return {
+        arrayBuffer: () => read(from, to),
+        text: async () => new TextDecoder().decode(await read(from, to)),
+      };
+    },
+  };
+}
+
+function addNativeFiles(metadata) {
+  if (queueIsLocked()) return "busy";
+  if (!window.XingqiaoDesktop?.readSendFileChunk) return "needs-update";
+  const incoming = Array.isArray(metadata) ? metadata : [];
+  const available = Math.max(0, MAX_BATCH_FILES - state.files.length - state.clipboardImages.length - (state.clipboardText.trim() ? 1 : 0));
+  const valid = incoming.filter(file => Number(file?.size) > 0 && Number(file.size) <= 4 * 1024 * 1024 * 1024 && file?.token).slice(0, available);
+  if (valid.length) setMode("files");
+  state.files.push(...valid.map(nativeSendFile));
+  renderFiles();
+  return valid.length ? "added" : "none";
+}
+
+// The macOS shelf stays available while the main window is hidden in the menu
+// bar. It can accept the first waiting transfer or queue native disk files
+// without opening the dashboard.
+window.XingqiaoQuickActions = Object.freeze({
+  acceptNext() {
+    const room = waitingReceiveRooms()[0];
+    const button = room && [...document.querySelectorAll(".accept")].find(item => item.dataset.room === room.room);
+    if (!button) return "none";
+    button.click();
+    return "accepted";
+  },
+  addNativeFiles,
+});
+
+function renderIncoming() {
   const receiving = [...state.incomingProgress.values()].map(receivingCard).join("");
-  const waiting = state.rooms.filter(room => room.room !== state.hosted && room.room !== ownPendingRoom && !activeRooms.has(room.room) && !state.dismissedRooms.has(room.room)).map(waitingCard).join("");
+  const waitingRooms = waitingReceiveRooms();
+  const waiting = waitingRooms.map(waitingCard).join("");
   const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.resource ? (file.dragUrl ? "已准备跨窗口直接投放" : file.saved ? `已保存至“${escapeHtml(file.folder)}” · 也可直接拖出` : "已保留在当前页面 · 可直接拖到其他应用") : file.nativeInbox ? (file.nativeFileId ? "已暂存到星桥临时收件箱，可直接拖入聊天" : "已暂存到星桥临时收件箱") : `已直接保存至“${escapeHtml(file.folder)}”`}</small></div></div>${file.resource ? `${preview(file, file, file.id, file.dragUrl)}<div class="transfer-files"><a class="download received-resource" draggable="true" data-received-id="${file.id}" data-drag-url="${file.dragUrl || file.url}" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}" title="拖到桌面、聊天窗口或其他应用；点击则另存"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} · 拖出使用 / 点击保存</span></a></div>` : file.nativeInbox ? nativeInboxControls(file) : `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>`}</article>`).join("");
   $("#incomingList").innerHTML = waiting || receiving || completed ? receiving + waiting + completed : '<div class="empty">暂时没有等待接收的内容</div>';
   document.querySelectorAll(".select-all").forEach(toggle => toggle.onchange = () => toggle.closest(".transfer").querySelectorAll(".receive-check").forEach(box => { box.checked = toggle.checked; }));
@@ -478,6 +542,7 @@ function renderIncoming() {
   document.querySelectorAll("[data-open-native-inbox]").forEach(button => button.onclick = () => {
     try { window.XingqiaoDesktop?.showInbox?.(); } catch (_) { toast("请在星桥桌面端打开临时收件箱"); }
   });
+  syncNativeInboxStatus(waitingRooms.length);
   scheduleNativeDragTargets();
 }
 
@@ -1412,3 +1477,8 @@ window.addEventListener("pagehide", () => {
 setupAndroidBinaryBridge();
 setMode("photos"); renderFiles(); importAndroidSharedFiles(); connect();
 setupNativeUpdate();
+// WKWebView marks the desktop bridge's origin trusted only after navigation
+// finishes. Render work above can occur slightly earlier, so repeat this one
+// lightweight status sync after that hand-off; otherwise an already-waiting
+// transfer would not light up the floating inbox until the next socket event.
+setTimeout(() => syncNativeInboxStatus(waitingReceiveRooms().length), 750);
