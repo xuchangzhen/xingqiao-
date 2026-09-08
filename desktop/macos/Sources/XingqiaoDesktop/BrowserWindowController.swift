@@ -5,6 +5,9 @@ import WebKit
 final class BrowserWindowController: NSWindowController, WKNavigationDelegate, NSWindowDelegate {
     private let bridge: DesktopBridge
     private let webView: NativeFileDragWebView
+    private let updateService = DesktopUpdateService()
+    private let versionLabel = NSTextField(labelWithString: "")
+    private let updateButton = NSButton(title: "检查更新", target: nil, action: nil)
     private var endpoint: URL?
 
     init(store: TempInboxStore, shelf: InboxPanelController) {
@@ -40,17 +43,45 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
         window.minSize = NSSize(width: 720, height: 560)
         super.init(window: window)
         webView.translatesAutoresizingMaskIntoConstraints = false
-        window.contentView = NSView()
-        window.contentView?.addSubview(webView)
+        let root = NSView()
+        let header = NSView()
+        let titleLabel = NSTextField(labelWithString: "星桥")
+        let spacer = NSView()
+        let headerStack = NSStackView(views: [titleLabel, versionLabel, spacer, updateButton])
+        header.translatesAutoresizingMaskIntoConstraints = false
+        headerStack.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        versionLabel.stringValue = "版本 v\(DesktopUpdateService.currentVersion)"
+        versionLabel.font = .systemFont(ofSize: 11)
+        versionLabel.textColor = .secondaryLabelColor
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        headerStack.orientation = .horizontal
+        headerStack.alignment = .centerY
+        headerStack.spacing = 9
+        updateButton.bezelStyle = .rounded
+        updateButton.target = self
+        updateButton.action = #selector(checkForUpdates)
+        header.addSubview(headerStack)
+        root.addSubview(header)
+        root.addSubview(webView)
+        window.contentView = root
         NSLayoutConstraint.activate([
-            webView.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
-            webView.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
+            header.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            header.topAnchor.constraint(equalTo: root.topAnchor),
+            header.heightAnchor.constraint(equalToConstant: 40),
+            headerStack.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
+            headerStack.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+            headerStack.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            webView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            webView.topAnchor.constraint(equalTo: header.bottomAnchor),
+            webView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
         webView.navigationDelegate = self
         window.delegate = self
         bridge.nativeDragTargetHandler = { [weak self] targets in self?.webView.updateNativeDragTargets(targets) }
+        bridge.checkForUpdateHandler = { [weak self] in self?.checkForUpdates() }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -71,6 +102,28 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
     }
 
     func reloadFromOrigin() { webView.reloadFromOrigin() }
+
+    @objc func checkForUpdates() {
+        guard updateButton.isEnabled else { return }
+        updateButton.isEnabled = false
+        updateButton.title = "检查中…"
+        updateService.check { [weak self] result in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.updateButton.isEnabled = true
+                self.updateButton.title = "检查更新"
+                switch result {
+                case .latest:
+                    self.updateButton.title = "已是最新"
+                    self.showUpdateAlert(title: "已是最新版本", message: "当前版本为 v\(DesktopUpdateService.currentVersion)。")
+                case .available(let release):
+                    self.promptDownload(release)
+                case .failed(let message):
+                    self.showUpdateAlert(title: "检查更新失败", message: message)
+                }
+            }
+        }
+    }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
@@ -152,6 +205,39 @@ final class BrowserWindowController: NSWindowController, WKNavigationDelegate, N
         webView.load(URLRequest(url: components?.url ?? url, cachePolicy: .reloadIgnoringLocalCacheData))
     }
 
+    private func promptDownload(_ release: DesktopRelease) {
+        let alert = NSAlert()
+        alert.messageText = "发现新版本 v\(release.version)"
+        alert.informativeText = "将下载 macOS 更新包到“下载”文件夹。下载后请退出星桥，解压并用新版替换旧 App。"
+        alert.addButton(withTitle: "下载更新")
+        alert.addButton(withTitle: "稍后")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        updateButton.isEnabled = false
+        updateButton.title = "下载 v\(release.version)…"
+        updateService.download(release) { [weak self] result in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.updateButton.isEnabled = true
+                switch result {
+                case .success(let url):
+                    self.updateButton.title = "已下载 v\(release.version)"
+                    self.showUpdateAlert(title: "更新包已下载", message: "已保存到：\(url.path)\n\n退出星桥后，解压并将新版 App 替换旧版。")
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                case .failed:
+                    self.updateButton.title = "检查更新"
+                    self.showUpdateAlert(title: "下载更新失败", message: "请检查网络后重试。")
+                }
+            }
+        }
+    }
+
+    private func showUpdateAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.runModal()
+    }
+
     private func showInvalidEndpoint() {
         let alert = NSAlert()
         alert.messageText = "网页地址无效"
@@ -177,6 +263,8 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
         setTransferActive: active => call('setTransferActive', { active: !!active }),
         showInbox: () => call('showInbox'),
         syncNativeDragTargets: targets => call('syncNativeDragTargets', { targets }),
+        checkForUpdate: () => call('checkForUpdate'),
+        appVersion: () => call('appVersion'),
       });
     })();
     """
@@ -185,6 +273,7 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
     private weak var shelf: InboxPanelController?
     var trustedOrigin: URL?
     var nativeDragTargetHandler: (([NativeFileDragTarget]) -> Void)?
+    var checkForUpdateHandler: (() -> Void)?
 
     init(store: TempInboxStore, shelf: InboxPanelController) {
         self.store = store
@@ -226,6 +315,11 @@ final class DesktopBridge: NSObject, WKScriptMessageHandlerWithReply {
             case "showInbox":
                 shelf?.show()
                 replyHandler(true, nil)
+            case "checkForUpdate":
+                checkForUpdateHandler?()
+                replyHandler(true, nil)
+            case "appVersion":
+                replyHandler(["version": DesktopUpdateService.currentVersion], nil)
             case "setTransferActive":
                 replyHandler(true, nil)
             case "syncNativeDragTargets":

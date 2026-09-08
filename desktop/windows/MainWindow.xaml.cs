@@ -19,8 +19,9 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _shelf = new InboxWindow(_store);
-        _bridge = new DesktopBridge(_store, _shelf);
+        _bridge = new DesktopBridge(_store, _shelf, CheckForUpdates);
         _webProfile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Xingqiao", "WebView");
+        VersionText.Text = $"版本 v{DesktopUpdateService.CurrentVersion}";
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -90,6 +91,60 @@ public partial class MainWindow : Window
 
     private void ShowInbox_Click(object sender, RoutedEventArgs e) => _shelf.ShowInbox();
     private void Refresh_Click(object sender, RoutedEventArgs e) => WebView.CoreWebView2?.Reload();
+    private async void CheckUpdate_Click(object sender, RoutedEventArgs e) => await CheckForUpdatesAsync();
+
+    private void CheckForUpdates()
+    {
+        if (Dispatcher.CheckAccess())
+        {
+            _ = CheckForUpdatesAsync();
+            return;
+        }
+        _ = Dispatcher.InvokeAsync(() => { _ = CheckForUpdatesAsync(); });
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        if (!UpdateButton.IsEnabled) return;
+        UpdateButton.IsEnabled = false;
+        UpdateButton.Content = "检查中…";
+        var check = await DesktopUpdateService.CheckAsync();
+        UpdateButton.IsEnabled = true;
+        UpdateButton.Content = "检查更新";
+        if (check.State == DesktopUpdateState.Latest)
+        {
+            UpdateButton.Content = "已是最新";
+            WpfMessageBox.Show($"当前版本 v{DesktopUpdateService.CurrentVersion} 已是最新。", "星桥", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        if (check.State == DesktopUpdateState.Failed || check.Release is null)
+        {
+            WpfMessageBox.Show(check.Message ?? "检查更新失败，请稍后重试。", "星桥", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var choice = WpfMessageBox.Show(
+            $"发现新版本 v{check.Release.Version}。\n\n将下载 Windows 更新包到“下载”文件夹；退出星桥后请解压并替换旧版。",
+            "星桥更新", MessageBoxButton.YesNo, MessageBoxImage.Information, MessageBoxResult.Yes);
+        if (choice != MessageBoxResult.Yes) return;
+
+        UpdateButton.IsEnabled = false;
+        UpdateButton.Content = $"下载 v{check.Release.Version}…";
+        try
+        {
+            var path = await DesktopUpdateService.DownloadAsync(check.Release);
+            UpdateButton.IsEnabled = true;
+            UpdateButton.Content = $"已下载 v{check.Release.Version}";
+            WpfMessageBox.Show($"更新包已下载到：\n{path}\n\n退出星桥后请解压并替换旧版。", "星桥更新", MessageBoxButton.OK, MessageBoxImage.Information);
+            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true });
+        }
+        catch
+        {
+            UpdateButton.IsEnabled = true;
+            UpdateButton.Content = "检查更新";
+            WpfMessageBox.Show("下载更新失败，请检查网络后重试。", "星桥", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
 
     private void ChangeEndpoint_Click(object sender, RoutedEventArgs e)
     {

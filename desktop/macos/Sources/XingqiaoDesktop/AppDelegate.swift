@@ -52,7 +52,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(actionItem("显示星桥", action: #selector(showWindow), keyEquivalent: ""))
         menu.addItem(actionItem("显示临时收件箱", action: #selector(showInbox), keyEquivalent: "i"))
         menu.addItem(actionItem("刷新网页", action: #selector(reloadWeb), keyEquivalent: "r"))
+        menu.addItem(actionItem("检查更新…", action: #selector(checkForUpdates), keyEquivalent: ""))
         menu.addItem(actionItem("更改网页地址…", action: #selector(changeEndpoint), keyEquivalent: ","))
+        let version = NSMenuItem(title: "当前版本 v\(DesktopUpdateService.currentVersion)", action: nil, keyEquivalent: "")
+        version.isEnabled = false
+        menu.addItem(version)
         if includeQuit {
             menu.addItem(.separator())
             let quit = NSMenuItem(title: "退出星桥", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -71,5 +75,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showWindow() { browser.show() }
     @objc private func showInbox() { shelf.show() }
     @objc private func reloadWeb() { browser.reloadFromOrigin() }
+    @objc private func checkForUpdates() { browser.checkForUpdates() }
     @objc private func changeEndpoint() { browser.promptForEndpoint() }
 }
