@@ -34,10 +34,13 @@ final class InboxPanelController: NSWindowController, NSCollectionViewDataSource
         )
         panel.title = "星桥临时收件箱"
         panel.minSize = NSSize(width: 560, height: 430)
-        panel.isFloatingPanel = true
-        panel.level = .floating
-        panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // Keep the shelf attached to Starbridge's normal window group. It
+        // should disappear as soon as another app becomes active instead of
+        // remaining above every desktop window.
+        panel.isFloatingPanel = false
+        panel.level = .normal
+        panel.hidesOnDeactivate = true
+        panel.collectionBehavior = []
         super.init(window: panel)
         buildInterface(in: panel)
         store.onChange = { [weak self] in self?.reload(selectNewest: true) }
