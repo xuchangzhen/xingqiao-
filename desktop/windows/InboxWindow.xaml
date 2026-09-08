@@ -7,21 +7,27 @@
     <StackPanel DockPanel.Dock="Top">
       <TextBlock Text="拖动文件到 ChatGPT、Codex 或任意支持文件投放的应用" FontWeight="SemiBold" TextWrapping="Wrap" />
       <TextBlock Margin="0,5,0,14" Foreground="#63708A" FontSize="12" TextWrapping="Wrap"
-                 Text="文件仅暂存在星桥；点击“保存到…”后才会永久保留。退出星桥会清理其余文件。" />
+                 Text="点击行选中；按 Ctrl 或 Shift 可多选。仅“保存选中项”会永久保留，退出星桥会清理其余文件。" />
+      <DockPanel Margin="0,0,0,8">
+        <TextBlock x:Name="SelectionText" Foreground="#63708A" FontSize="12" VerticalAlignment="Center" Text="未选中文件" />
+        <Button x:Name="SelectAllButton" DockPanel.Dock="Right" Content="全选" Click="SelectAll_Click" IsEnabled="False" />
+      </DockPanel>
     </StackPanel>
     <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
-      <Button x:Name="RemoveButton" Content="移除" Click="Remove_Click" IsEnabled="False" />
-      <Button x:Name="SaveButton" Content="保存到…" Click="Save_Click" IsEnabled="False" />
+      <Button x:Name="PreviewButton" Content="预览" Click="Preview_Click" IsEnabled="False" />
+      <Button x:Name="RemoveButton" Content="移除选中项" Click="Remove_Click" IsEnabled="False" />
+      <Button x:Name="SaveButton" Content="保存选中项到…" Click="Save_Click" IsEnabled="False" />
     </StackPanel>
     <Grid>
       <ListBox x:Name="FilesList" ItemsSource="{Binding Files}" SelectionChanged="FilesList_SelectionChanged"
                PreviewMouseLeftButtonDown="FilesList_PreviewMouseLeftButtonDown"
-               PreviewMouseMove="FilesList_PreviewMouseMove" BorderBrush="#D8E0EF" BorderThickness="1">
+               PreviewMouseMove="FilesList_PreviewMouseMove" MouseDoubleClick="FilesList_MouseDoubleClick"
+               SelectionMode="Extended" BorderBrush="#D8E0EF" BorderThickness="1">
         <ListBox.ItemTemplate>
           <DataTemplate>
-            <StackPanel Margin="8,5">
+            <StackPanel Margin="8,7">
               <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" FontWeight="SemiBold" />
-              <TextBlock Text="拖出即可使用 · 尚未永久保存" Foreground="#63708A" FontSize="11" />
+              <TextBlock Text="拖出即可使用 · 双击预览 · 尚未永久保存" Foreground="#63708A" FontSize="11" />
             </StackPanel>
           </DataTemplate>
         </ListBox.ItemTemplate>

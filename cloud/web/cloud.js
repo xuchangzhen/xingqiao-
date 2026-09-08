@@ -451,12 +451,21 @@ const scheduleNativeDragTargets = (() => {
 window.addEventListener("resize", scheduleNativeDragTargets);
 window.addEventListener("scroll", scheduleNativeDragTargets, true);
 
+function nativeInboxControls(file) {
+  const name = escapeHtml(file.name);
+  const details = size(file.size);
+  if (file.nativeFileId) {
+    return `<div class="transfer-files native-inbox-actions"><button class="secondary native-inbox native-direct-drag" data-native-file-id="${escapeHtml(file.nativeFileId)}" title="按住并拖到聊天输入框、Codex 或其他应用"><strong>${name}</strong><span>${details} · 按住这里拖入聊天</span></button><button class="native-inbox-open" data-open-native-inbox title="打开临时收件箱后可预览、选择或保存">打开收件箱 / 预览</button></div>`;
+  }
+  return `<div class="transfer-files native-inbox-actions"><button class="secondary native-inbox" data-open-native-inbox title="打开临时收件箱"><strong>${name}</strong><span>${details} · 点击打开收件箱后拖出</span></button><button class="native-inbox-open" data-open-native-inbox title="打开临时收件箱后可预览、选择或保存">打开收件箱 / 预览</button></div>`;
+}
+
 function renderIncoming() {
   const ownPendingRoom = state.pendingHost?.room;
   const activeRooms = new Set(state.incomingProgress.keys());
   const receiving = [...state.incomingProgress.values()].map(receivingCard).join("");
   const waiting = state.rooms.filter(room => room.room !== state.hosted && room.room !== ownPendingRoom && !activeRooms.has(room.room) && !state.dismissedRooms.has(room.room)).map(waitingCard).join("");
-  const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.resource ? (file.dragUrl ? "已准备跨窗口直接投放" : file.saved ? `已保存至“${escapeHtml(file.folder)}” · 也可直接拖出` : "已保留在当前页面 · 可直接拖到其他应用") : file.nativeInbox ? (file.nativeFileId ? "已暂存到桌面收件箱，可直接从此处拖入聊天" : "已暂存到桌面收件箱，可从悬浮窗直接拖入聊天") : `已直接保存至“${escapeHtml(file.folder)}”`}</small></div></div>${file.resource ? `${preview(file, file, file.id, file.dragUrl)}<div class="transfer-files"><a class="download received-resource" draggable="true" data-received-id="${file.id}" data-drag-url="${file.dragUrl || file.url}" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}" title="拖到桌面、聊天窗口或其他应用；点击则另存"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} · 拖出使用 / 点击保存</span></a></div>` : file.nativeInbox ? `<div class="transfer-files"><button class="secondary native-inbox"${file.nativeFileId ? ` data-native-file-id="${escapeHtml(file.nativeFileId)}" title="拖动即可交给聊天窗口；点击打开临时收件箱"` : ""} data-open-native-inbox><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} · ${file.nativeFileId ? "直接拖入聊天 / 点击打开收件箱" : "在悬浮收件箱中拖出"}</span></button></div>` : `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>`}</article>`).join("");
+  const completed = state.received.map(file => `<article class="transfer"><div class="transfer-top"><span class="avatar">✓</span><div><b>已接收</b><small>${file.resource ? (file.dragUrl ? "已准备跨窗口直接投放" : file.saved ? `已保存至“${escapeHtml(file.folder)}” · 也可直接拖出` : "已保留在当前页面 · 可直接拖到其他应用") : file.nativeInbox ? (file.nativeFileId ? "已暂存到星桥临时收件箱，可直接拖入聊天" : "已暂存到星桥临时收件箱") : `已直接保存至“${escapeHtml(file.folder)}”`}</small></div></div>${file.resource ? `${preview(file, file, file.id, file.dragUrl)}<div class="transfer-files"><a class="download received-resource" draggable="true" data-received-id="${file.id}" data-drag-url="${file.dragUrl || file.url}" data-mime="${escapeHtml(file.mime)}" href="${file.url}" download="${escapeHtml(file.name)}" title="拖到桌面、聊天窗口或其他应用；点击则另存"><strong>${escapeHtml(file.name)}</strong><span>${size(file.size)} · 拖出使用 / 点击保存</span></a></div>` : file.nativeInbox ? nativeInboxControls(file) : `<div class="transfer-files"><div class="download"><strong>${escapeHtml(file.name)}</strong><span>已保存 ✓</span></div></div>`}</article>`).join("");
   $("#incomingList").innerHTML = waiting || receiving || completed ? receiving + waiting + completed : '<div class="empty">暂时没有等待接收的内容</div>';
   document.querySelectorAll(".select-all").forEach(toggle => toggle.onchange = () => toggle.closest(".transfer").querySelectorAll(".receive-check").forEach(box => { box.checked = toggle.checked; }));
   document.querySelectorAll(".receive-check").forEach(box => box.onchange = () => { const card = box.closest(".transfer"); const all = [...card.querySelectorAll(".receive-check")]; card.querySelector(".select-all").checked = all.every(item => item.checked); });

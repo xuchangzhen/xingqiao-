@@ -98,6 +98,9 @@ public sealed class DesktopBridge
         if (string.IsNullOrEmpty(token)) throw new InvalidOperationException("无效请求");
         _store.Finish(token);
         _shelf.ShowInbox();
+        // WebView2 cannot start a native OS file drag from a DOM rectangle.
+        // Do not claim that the web card itself is draggable on Windows; the
+        // real FileDrop drag is provided by the native inbox shelf.
         return new { ok = true, folder = "星桥临时收件箱", temporary = true };
     }
 
