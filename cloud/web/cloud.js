@@ -29,6 +29,8 @@ let socket;
 let iceServers = [];
 const peers = new Map();
 const channels = new Set();
+const relayChannels = new Map();
+const relayPending = new Map();
 const pendingCandidates = new Map();
 const receiveFolders = new Map();
 // Android's modern WebView bridge replies after each ArrayBuffer has reached
@@ -43,8 +45,8 @@ const IMAGE_PREVIEW_SIZE_LIMIT = 8 * 1024 * 1024;
 const MAX_BATCH_FILES = 40;
 const PROGRESS_PAINT_INTERVAL = 160;
 const SPEED_SMOOTHING = 0.28;
-// Keep Android's queued WebView/MediaStore work bounded, but leave enough data
-// in flight to fill a normal Wi-Fi link even when WebRTC has a higher RTT.
+// Bound Android's queued WebView/MediaStore work while allowing enough credit
+// for a cross-network round trip. ACKs are issued after native writes finish.
 // Read Android content URIs in larger blocks. Android WebView pays a noticeable
 // scheduling cost for every File.slice().arrayBuffer() call, so small network
 // frames are carved out of a larger read instead of reopening the picker URI
@@ -63,9 +65,9 @@ const ANDROID_RECEIVE_ACK_BYTES = 256 * 1024;
 const BROWSER_RECEIVE_ACK_BYTES = 4 * 1024 * 1024;
 const ANDROID_BINARY_WRITE_BATCH_BYTES = 256 * 1024;
 const BROWSER_WRITABLE_BATCH_BYTES = 4 * 1024 * 1024;
-const ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES = 1024 * 1024;
+const ANDROID_RECEIVER_MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024;
 const BROWSER_RECEIVER_MAX_IN_FLIGHT_BYTES = 32 * 1024 * 1024;
-const ANDROID_RECEIVER_BUFFER_HIGH_BYTES = 768 * 1024;
+const ANDROID_RECEIVER_BUFFER_HIGH_BYTES = 2 * 1024 * 1024;
 // Chromium's per-channel send queue is commonly capped near 16 MiB. Leave
 // generous headroom so a single send() can never trip that hard limit.
 const BROWSER_RECEIVER_BUFFER_HIGH_BYTES = 6 * 1024 * 1024;
@@ -636,6 +638,7 @@ function publishPendingHost() {
 function buildPeer(remote, room, selectedIndexes = null) {
   const existing = peers.get(remote);
   if (existing) {
+    clearTimeout(existing.xqFallbackTimer);
     try { existing.close(); } catch (_) {}
   }
   // ICE assigns host candidates a higher priority than server-reflexive and
@@ -645,8 +648,60 @@ function buildPeer(remote, room, selectedIndexes = null) {
   peers.set(remote, connection);
   connection.onicecandidate = event => { if (event.candidate) send({ type: "signal", target: remote, room, payload: { kind: "candidate", candidate: event.candidate } }); };
   connection.ondatachannel = event => setupChannel(event.channel, remote, room, selectedIndexes);
-  connection.onconnectionstatechange = () => { if (["failed", "closed"].includes(connection.connectionState) && peers.get(remote) === connection) peers.delete(remote); };
+  connection.onconnectionstatechange = () => {
+    if (connection.connectionState === "failed" && peers.get(remote) === connection && Array.isArray(connection.xqSelected)) fallbackToRelay(remote, room);
+    if (connection.connectionState === "closed" && peers.get(remote) === connection) peers.delete(remote);
+  };
   return connection;
+}
+
+function createRelayChannel(remote, room, selectedIndexes = null, receiverKind = "browser") {
+  relayChannels.get(remote)?.close();
+  const transport = socket;
+  const target = new TextEncoder().encode(remote);
+  const channel = {
+    isRelay: true,
+    readyState: "open",
+    get bufferedAmount() { return transport.bufferedAmount; },
+    addEventListener() {},
+    removeEventListener() {},
+    send(data) {
+      if (this.readyState !== "open" || transport.readyState !== WebSocket.OPEN) throw new Error("中转连接已关闭");
+      if (typeof data === "string") {
+        transport.send(JSON.stringify({ type: "relay-control", target: remote, room, data }));
+      } else {
+        const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+        const frame = new Uint8Array(2 + target.length + bytes.byteLength);
+        frame[0] = 1;
+        frame[1] = target.length;
+        frame.set(target, 2);
+        frame.set(bytes, 2 + target.length);
+        transport.send(frame);
+      }
+    },
+    close() {
+      if (this.readyState === "closed") return;
+      this.readyState = "closed";
+      if (relayChannels.get(remote) === this) relayChannels.delete(remote);
+      this.onclose?.();
+    },
+  };
+  relayChannels.set(remote, channel);
+  setupChannel(channel, remote, room, selectedIndexes, receiverKind);
+  queueMicrotask(() => channel.readyState === "open" && channel.onopen?.());
+  return channel;
+}
+
+function fallbackToRelay(remote, room) {
+  const peer = peers.get(remote);
+  if (!peer || state.hosted !== room || peer.xqFallbackStarted || peer.xqChannel?.readyState === "open" || !Array.isArray(peer.xqSelected)) return;
+  peer.xqFallbackStarted = true;
+  clearTimeout(peer.xqFallbackTimer);
+  relayPending.set(remote, { room, selected: peer.xqSelected, receiverKind: peer.xqReceiverKind });
+  try { peer.close(); } catch (_) {}
+  peers.delete(remote);
+  $("#privacy").textContent = "设备直连未建立，正在通过 HTTPS 服务器中转…";
+  send({ type: "signal", target: remote, room, payload: { kind: "relay-start" } });
 }
 
 function setupChannel(channel, remote, room, selectedIndexes = null, receiverKind = "browser") {
@@ -674,7 +729,11 @@ function setupChannel(channel, remote, room, selectedIndexes = null, receiverKin
   channel.bufferedAmountLowThreshold = channel.bufferLowWaterBytes;
   channels.add(channel);
   channel.onopen = () => {
-    showConnectionPath(remote);
+    if (channel.isRelay) $("#privacy").textContent = "已连接：HTTPS 服务器中转传输（文件不落盘，速度受服务器带宽影响）";
+    else {
+      clearTimeout(peers.get(remote)?.xqFallbackTimer);
+      showConnectionPath(remote);
+    }
     if (!channel.isSender || state.hosted !== room) return;
     channel.outgoingFiles = state.activeFiles.filter((_, index) => channel.selectedIndexes.includes(index));
     beginOutgoingProgress(room, channel.outgoingFiles);
@@ -747,7 +806,11 @@ function isPrivateLanCandidate(candidate) {
 async function createOffer(remote, room, selectedIndexes, receiverKind = "browser") {
   const connection = buildPeer(remote, room, selectedIndexes);
   const channel = connection.createDataChannel("xingqiao-files", { ordered: true });
+  connection.xqSelected = selectedIndexes;
+  connection.xqReceiverKind = receiverKind;
+  connection.xqChannel = channel;
   setupChannel(channel, remote, room, selectedIndexes, receiverKind);
+  connection.xqFallbackTimer = setTimeout(() => fallbackToRelay(remote, room), 10000);
   await connection.setLocalDescription(await connection.createOffer());
   send({ type: "signal", target: remote, room, payload: { kind: "offer", sdp: connection.localDescription } });
   $("#privacy").textContent = "正在优先建立局域网直连…";
@@ -756,6 +819,23 @@ async function createOffer(remote, room, selectedIndexes, receiverKind = "browse
 async function handleSignal(remote, room, payload) {
   if (!payload) return;
   let connection = peers.get(remote);
+  if (payload.kind === "relay-start") {
+    if (connection) {
+      try { connection.close(); } catch (_) {}
+      peers.delete(remote);
+    }
+    createRelayChannel(remote, room);
+    send({ type: "signal", target: remote, room, payload: { kind: "relay-ready" } });
+    return;
+  }
+  if (payload.kind === "relay-ready") {
+    const pending = relayPending.get(remote);
+    if (pending?.room === room) {
+      relayPending.delete(remote);
+      createRelayChannel(remote, room, pending.selected, pending.receiverKind);
+    }
+    return;
+  }
   if (payload.kind === "offer") {
     connection = buildPeer(remote, room);
     $("#privacy").textContent = "正在优先建立局域网直连…";
@@ -821,7 +901,7 @@ function waitForDataChannelDrain(channel) {
       channel.removeEventListener("bufferedamountlow", finish);
       resolve();
     };
-    const timer = setTimeout(finish, 250);
+    const timer = setTimeout(finish, channel.isRelay ? 20 : 250);
     channel.addEventListener("bufferedamountlow", finish);
     // Avoid the small race where the buffer drains between the first check and
     // listener registration.
@@ -910,7 +990,7 @@ async function sendFilesImpl(channel) {
   await waitForAllRemoteCredit(channel);
   finishOutgoingProgress(channel.room);
   finishOutgoingBatch(channel.room);
-  toast("内容已通过点对点连接发送");
+  toast(channel.isRelay ? "内容已通过 HTTPS 中转发送" : "内容已通过点对点连接发送");
 }
 
 function finishOutgoingBatch(room) {
@@ -1078,7 +1158,7 @@ function mergeArrayBuffers(buffers, byteLength) {
 /**
  * Modern Android WebView can pass ArrayBuffers to the native MediaStore bridge
  * without Base64. Coalesce a few safe WebRTC packets before crossing that
- * bridge: this removes most UI-thread round trips while retaining the 1 MiB
+ * bridge: this removes most UI-thread round trips while retaining the 8 MiB
  * Android back-pressure limit and bounded memory use.
  */
 async function flushAndroidBinaryBuffer(channel) {
@@ -1297,16 +1377,24 @@ async function connect() {
   try { iceServers = (await fetch("/api/config", { cache: "no-store" }).then(response => response.json())).iceServers || []; } catch (_) {}
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   const activeSocket = new WebSocket(`${protocol}://${location.host}/signal`);
+  activeSocket.binaryType = "arraybuffer";
   socket = activeSocket;
   activeSocket.onopen = () => {
     if (socket !== activeSocket) return;
-    $("#privacy").textContent = "已连接：文件将点对点传输";
+    $("#privacy").textContent = "已连接：优先点对点传输，失败时使用 HTTPS 中转";
     renderFiles();
     send({ type: "list" });
     publishPendingHost();
   };
   activeSocket.onmessage = async event => {
     if (socket !== activeSocket) return;
+    if (typeof event.data !== "string") {
+      const frame = new Uint8Array(event.data);
+      if (frame.length < 3 || frame[0] !== 1 || frame[1] + 2 >= frame.length) return;
+      const remote = new TextDecoder().decode(frame.subarray(2, 2 + frame[1]));
+      relayChannels.get(remote)?.onmessage?.({ data: frame.buffer.slice(2 + frame[1]) });
+      return;
+    }
     const message = JSON.parse(event.data);
     if (message.type === "rooms") { state.rooms = message.rooms; renderIncoming(); }
     if (message.type === "hosted" && state.pendingHost?.room === message.room) {
@@ -1320,13 +1408,16 @@ async function connect() {
     }
     if (message.type === "peer-joined" && state.hosted === message.room) {
       $("#sendButton").innerHTML = "正在传输… <i>●</i>";
-      createOffer(message.peer, message.room, message.selected, message.receiver).catch(() => toast("无法建立设备直连，请确认双方仍在线后重试"));
+      createOffer(message.peer, message.room, message.selected, message.receiver).catch(() => fallbackToRelay(message.peer, message.room));
     }
     if (message.type === "signal") await handleSignal(message.from, message.room, message.payload);
+    if (message.type === "relay-control") relayChannels.get(message.from)?.onmessage?.({ data: message.data });
   };
   activeSocket.onclose = () => {
     if (socket !== activeSocket) return;
     clearTimeout(hostPublishRetry);
+    for (const channel of relayChannels.values()) channel.close();
+    relayPending.clear();
     if (state.hosted && state.hostMeta) state.pendingHost = { room: state.hosted, meta: state.hostMeta };
     state.hosted = null;
     if (state.pendingHost) $("#sendButton").innerHTML = "连接恢复后继续分享… <i>●</i>";

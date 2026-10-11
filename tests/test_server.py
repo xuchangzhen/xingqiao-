@@ -68,7 +68,7 @@ class TransferServerTest(unittest.TestCase):
         self.assertIn("app.js", html)
 
     def test_raw_upload_can_be_downloaded_while_it_is_still_arriving(self):
-        content = b"first-half--second-half"
+        content = b"A" * (256 * 1024) + b"B" * (256 * 1024)
         init = json.dumps({
             "sender": "fast-browser",
             "mode": "files",

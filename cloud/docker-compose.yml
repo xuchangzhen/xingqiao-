@@ -25,15 +25,15 @@ services:
   turn:
     image: coturn/coturn:4.6.3
     restart: unless-stopped
+    # Linux VPS: avoid Docker bridge NAT and its private relay candidates.
+    network_mode: host
     command: >-
       -n --log-file=stdout --fingerprint --lt-cred-mech
       --realm=${DOMAIN} --use-auth-secret --static-auth-secret=${TURN_SECRET}
+      --external-ip=${TURN_PUBLIC_IP:?set TURN_PUBLIC_IP to the VPS public IPv4}
       --min-port=49160 --max-port=49200
+      --no-tls --no-dtls
       --no-multicast-peers --no-cli
-    ports:
-      - "3478:3478/tcp"
-      - "3478:3478/udp"
-      - "49160-49200:49160-49200/udp"
 
 volumes:
   caddy_data:

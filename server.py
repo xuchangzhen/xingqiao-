@@ -448,9 +448,11 @@ class Handler(BaseHTTPRequestHandler):
             remaining = length
             with file.path.open("wb", buffering=0) as out:
                 while remaining:
-                    read_size = min(4 * 1024 * 1024, remaining)
-                    read1 = getattr(self.rfile, "read1", None)
-                    chunk = read1(read_size) if read1 else self.rfile.read(read_size)
+                    read_size = min(256 * 1024, remaining)
+                    # read1() may return each small TCP segment separately. A
+                    # blocking read coalesces them before the disk write and
+                    # wakes any streaming receivers once per large block.
+                    chunk = self.rfile.read(read_size)
                     if not chunk:
                         raise ValueError("上传意外中断")
                     out.write(chunk)
@@ -495,25 +497,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def stream_file(self, file: TransferFile) -> None:
         with file.path.open("rb") as source:
-            if file.complete:
-                # socket.sendfile uses the platform's zero-copy path where
-                # available and transparently falls back on unsupported hosts.
-                self.wfile.flush()
-                self.connection.sendfile(source)
-                return
             sent = 0
+            self.wfile.flush()
             while sent < file.size:
-                chunk = source.read(min(4 * 1024 * 1024, file.size - sent))
-                if chunk:
-                    self.wfile.write(chunk)
-                    sent += len(chunk)
-                    continue
                 with file.condition:
                     if file.failed:
                         raise ConnectionAbortedError("上传端已中断")
-                    if file.complete and file.bytes_written <= sent:
-                        break
-                    file.condition.wait(timeout=0.5)
+                    available = min(file.bytes_written, file.size) - sent
+                    if available <= 0:
+                        if file.complete:
+                            break
+                        file.condition.wait(timeout=0.5)
+                        continue
+                # sendfile works for both finished and growing regular files.
+                # Passing count prevents it from reading beyond the bytes the
+                # uploader has actually committed to disk.
+                written = self.connection.sendfile(source, offset=sent, count=min(available, 8 * 1024 * 1024))
+                if not written:
+                    raise ConnectionAbortedError("无法继续发送文件")
+                sent += written
             if sent != file.size:
                 raise ConnectionAbortedError("文件未完整上传")
 
